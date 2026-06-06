@@ -21,7 +21,6 @@ load_dotenv()
 # -------------------------------------------------------------------
 CLIENT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
-CORE_BOT_TOKEN = os.getenv("CORE_BOT_TOKEN")
 DB_PATH = "cad_exchange.db"
 
 # -------------------------------------------------------------------
@@ -788,6 +787,10 @@ async def cmd_help_executor(message: Message):
 async def cmd_cancel_state(message: Message, state: FSMContext):
     await state.clear()
     await message.answer("Отменено.")
+    
+@flask_app.route('/')
+def home():
+    return "CAD Exchange API is running"
 
 # -------------------------------------------------------------------
 # 4. Запуск всех компонентов в одном процессе
