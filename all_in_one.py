@@ -259,6 +259,11 @@ def api_order_get():
 
 @flask_app.route("/order/take", methods=["POST"])
 def api_order_take():
+    print(f"=== /order/take called ===")
+    print(f"Headers: {dict(request.headers)}")
+    print(f"Content-Type: {request.content_type}")
+    print(f"Raw data: {request.data}")
+    print(f"JSON: {request.json}")
     data = request.json
     order_id = data.get("order_id")
     executor_id = data.get("executor_id")
