@@ -412,16 +412,22 @@ class CreateOrder(StatesGroup):
     files = State()
 
 def api_request(method, endpoint, data=None, params=None):
-    url = f"http://localhost:{os.getenv('PORT', 8080)}{endpoint}"
+    # Используем порт 10000 принудительно для Render
+    port = 10000
+    url = f"http://127.0.0.1:{port}{endpoint}"
+    print(f"🔍 API Request: {method} {url}")
+    print(f"🔍 Data: {data}")
+    print(f"🔍 Params: {params}")
     try:
         if method == "GET":
             resp = requests.get(url, params=params, timeout=10)
         else:
             resp = requests.post(url, json=data, timeout=10)
+        print(f"🔍 Response status: {resp.status_code}")
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"API error: {e}")
+        print(f"❌ API error: {e}")
         return {"success": False, "error": str(e)}
 
 def register_user(tg_id, username):
@@ -679,10 +685,18 @@ async def cmd_feed(message: Message):
         await message.answer("Нет открытых заказов.")
         return
     for o in orders:
+        # Проверяем наличие файлов
+        has_files = o.get('files') and o['files'] != '[]'
+        files_indicator = " 📎" if has_files else ""
+        
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Взять", callback_data=f"take_{o['id']}")]
+            [InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{o['id']}")]
         ])
-        text = f"🔹 #{o['id']} | {o['title']}\n💰 {o['price']} баллов\n🔥 Срочность: {o['urgency']}\n📅 Снятие: {o['expires_at'][:10]}\n{o['description'][:100]}"
+        # Добавляем кнопку просмотра файлов, если они есть
+        if has_files:
+            kb.inline_keyboard.append([InlineKeyboardButton(text="📎 Посмотреть файлы", callback_data=f"files_{o['id']}")])
+        
+        text = f"🔹 #{o['id']} | {o['title']}{files_indicator}\n💰 {o['price']} баллов\n🔥 Срочность: {o['urgency']}\n📅 Снятие: {o['expires_at'][:10]}\n📝 {o['description'][:100]}"
         await message.answer(text, reply_markup=kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
@@ -695,6 +709,35 @@ async def callback_take(callback: CallbackQuery):
         await callback.message.edit_reply_markup(reply_markup=None)
     else:
         await callback.message.answer(f"❌ Не удалось взять: {resp.get('error')}")
+    await callback.answer()
+
+@dp_executor.callback_query_handler(lambda c: c.data.startswith("files_"))
+async def callback_show_files(callback: CallbackQuery):
+    order_id = int(callback.data.split("_")[1])
+    order_resp = api_request("GET", "/order/get", params={"id": order_id})
+    if not order_resp.get("success"):
+        await callback.message.answer("❌ Не удалось получить файлы")
+        await callback.answer()
+        return
+    
+    order_data = order_resp.get("data", {})
+    files_json = order_data.get("files", "[]")
+    try:
+        files = json.loads(files_json)
+    except:
+        files = []
+    
+    if not files:
+        await callback.message.answer("📭 Файлы не прикреплены")
+        await callback.answer()
+        return
+    
+    await callback.message.answer(f"📎 Файлы к заказу #{order_id}:")
+    for file_id in files:
+        try:
+            await callback.message.answer_document(file_id)
+        except Exception as e:
+            await callback.message.answer(f"❌ Не удалось отправить файл: {e}")
     await callback.answer()
 
 @dp_executor.message_handler(Command("take"))
@@ -833,6 +876,12 @@ async def run_bots_async():
         dp_client.start_polling(),
         dp_executor.start_polling()
     )
+
+# Вывод всех зарегистрированных маршрутов для отладки
+print("\n=== ЗАРЕГИСТРИРОВАННЫЕ МАРШРУТЫ ===")
+for rule in flask_app.url_map.iter_rules():
+    print(f"{rule.endpoint}: {list(rule.methods)} {rule}")
+print("=====================================\n")
 
 if __name__ == "__main__":
     logger.info("Запуск CAD Exchange платформы")
