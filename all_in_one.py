@@ -8,10 +8,10 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.filters import Text
-from aiogram.filters import Command, StateFilter
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
+from aiogram.dispatcher.filters import Command, Text, StateFilter
+from aiogram.contrib.fsm_storage.memory import MemoryStorage
+from aiogram.dispatcher import FSMContext
+from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 from dotenv import load_dotenv
@@ -387,10 +387,11 @@ def api_order_cancel():
     return jsonify({"success": True, "data": {"status": "cancelled"}})
 
 # -------------------------------------------------------------------
-# 2. Client Bot
+# 2. Client Bot (aiogram 2.x)
 # -------------------------------------------------------------------
+storage = MemoryStorage()
 client_bot = Bot(token=CLIENT_TOKEN)
-dp_client = Dispatcher()
+dp_client = Dispatcher(client_bot, storage=storage)
 
 class CreateOrder(StatesGroup):
     title = State()
@@ -440,7 +441,7 @@ def accept_order(order_id, customer_id):
 def cancel_order(order_id, user_id):
     return api_request("POST", "/order/cancel", data={"order_id": order_id, "user_id": user_id})
 
-@dp_client.message(Command("start"))
+@dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
@@ -457,7 +458,7 @@ async def cmd_start(message: Message):
         "/help - помощь"
     )
 
-@dp_client.message(Command("balance"))
+@dp_client.message_handler(Command("balance"))
 async def cmd_balance(message: Message):
     tg_id = message.from_user.id
     data = get_balance(tg_id)
@@ -468,62 +469,66 @@ async def cmd_balance(message: Message):
     else:
         await message.answer("❌ Не удалось получить баланс")
 
-@dp_client.message(Command("new"))
-async def cmd_new(message: Message, state: FSMContext):
-    await state.set_state(CreateOrder.title)
+@dp_client.message_handler(Command("new"))
+async def cmd_new(message: Message):
+    await CreateOrder.title.set()
     await message.answer("Введите заголовок задачи:")
 
-@dp_client.message(CreateOrder.title)
+@dp_client.message_handler(state=CreateOrder.title)
 async def process_title(message: Message, state: FSMContext):
-    await state.update_data(title=message.text)
-    await state.set_state(CreateOrder.description)
+    async with state.proxy() as data:
+        data['title'] = message.text
+    await CreateOrder.next()
     await message.answer("Введите описание задачи:")
 
-@dp_client.message(CreateOrder.description)
+@dp_client.message_handler(state=CreateOrder.description)
 async def process_description(message: Message, state: FSMContext):
-    await state.update_data(description=message.text)
-    await state.set_state(CreateOrder.price)
+    async with state.proxy() as data:
+        data['description'] = message.text
+    await CreateOrder.next()
     await message.answer("Укажите цену в баллах (целое число):")
 
-@dp_client.message(CreateOrder.price)
+@dp_client.message_handler(state=CreateOrder.price)
 async def process_price(message: Message, state: FSMContext):
     try:
         price = int(message.text)
         if price <= 0:
             raise ValueError
-        await state.update_data(price=price)
+        async with state.proxy() as data:
+            data['price'] = price
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="Низкая", callback_data="low"),
              InlineKeyboardButton(text="Средняя", callback_data="medium"),
              InlineKeyboardButton(text="Высокая", callback_data="high")]
         ])
-        await state.set_state(CreateOrder.urgency)
+        await CreateOrder.next()
         await message.answer("Выберите срочность:", reply_markup=kb)
     except:
         await message.answer("❌ Введите целое положительное число.")
 
-@dp_client.callback_query(CreateOrder.urgency)
+@dp_client.callback_query_handler(lambda c: c.data in ['low', 'medium', 'high'], state=CreateOrder.urgency)
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
-    urgency = callback.data
-    await state.update_data(urgency=urgency)
-    await state.set_state(CreateOrder.days)
+    async with state.proxy() as data:
+        data['urgency'] = callback.data
+    await CreateOrder.next()
     await callback.message.answer("Через сколько дней снять заказ с биржи, если не возьмут? (введите число дней, например 7)")
     await callback.answer()
 
-@dp_client.message(CreateOrder.days)
+@dp_client.message_handler(state=CreateOrder.days)
 async def process_days(message: Message, state: FSMContext):
     try:
         days = int(message.text)
         if days < 1:
             raise ValueError
-        await state.update_data(days=days)
-        await state.set_state(CreateOrder.files)
+        async with state.proxy() as data:
+            data['days'] = days
+        await CreateOrder.next()
         await message.answer("Приложите файлы к заданию (можно несколько, после отправки нажмите /done). Для завершения загрузки введите /done")
     except:
         await message.answer("❌ Введите целое число дней (минимум 1)")
 
 user_files = {}
-@dp_client.message(CreateOrder.files, lambda msg: msg.document is not None)
+@dp_client.message_handler(content_types=['document'], state=CreateOrder.files)
 async def process_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     file_id = message.document.file_id
@@ -532,12 +537,12 @@ async def process_files(message: Message, state: FSMContext):
     user_files[tg_id].append(file_id)
     await message.answer(f"Файл {message.document.file_name} добавлен. Можно добавить ещё или введите /done")
 
-@dp_client.message(CreateOrder.files, Command("done"))
+@dp_client.message_handler(Command("done"), state=CreateOrder.files)
 async def finish_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     files = user_files.get(tg_id, [])
     data = await state.get_data()
-    resp = create_order(tg_id, data["title"], data["description"], data["price"], data["urgency"], data["days"], files)
+    resp = create_order(tg_id, data['title'], data['description'], data['price'], data['urgency'], data['days'], files)
     if resp.get("success"):
         order_id = resp["data"]["order_id"]
         await message.answer(f"✅ Заказ №{order_id} создан! Списано {data['price']} баллов.")
@@ -545,14 +550,14 @@ async def finish_files(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {resp.get('error')}")
     if tg_id in user_files:
         del user_files[tg_id]
-    await state.clear()
+    await state.finish()
 
-@dp_client.message(Command("cancel"), StateFilter(None))
+@dp_client.message_handler(Command("cancel"), state='*')
 async def cancel_cmd(message: Message, state: FSMContext):
-    await state.clear()
+    await state.finish()
     await message.answer("Создание заказа отменено.")
 
-@dp_client.message(Command("my_orders"))
+@dp_client.message_handler(Command("my_orders"))
 async def cmd_my_orders(message: Message):
     tg_id = message.from_user.id
     resp = get_my_orders(tg_id)
@@ -568,7 +573,7 @@ async def cmd_my_orders(message: Message):
         text += f"#{o['id']} | {o['title']} | {o['status']} | {o['price']} баллов\n"
     await message.answer(text)
 
-@dp_client.message(Command("accept"))
+@dp_client.message_handler(Command("accept"))
 async def cmd_accept(message: Message):
     args = message.text.split()
     if len(args) != 2:
@@ -586,7 +591,7 @@ async def cmd_accept(message: Message):
     else:
         await message.answer(f"❌ Ошибка: {resp.get('error')}")
 
-@dp_client.message(Command("cancel_order"))
+@dp_client.message_handler(Command("cancel_order"))
 async def cmd_cancel_order(message: Message):
     args = message.text.split()
     if len(args) != 2:
@@ -604,7 +609,7 @@ async def cmd_cancel_order(message: Message):
     else:
         await message.answer(f"❌ Ошибка: {resp.get('error')}")
 
-@dp_client.message(Command("help"))
+@dp_client.message_handler(Command("help"))
 async def cmd_help(message: Message):
     await message.answer(
         "Команды бота заказчика:\n"
@@ -617,17 +622,17 @@ async def cmd_help(message: Message):
     )
 
 # -------------------------------------------------------------------
-# 3. Executor Bot
+# 3. Executor Bot (aiogram 2.x)
 # -------------------------------------------------------------------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
-dp_executor = Dispatcher()
+dp_executor = Dispatcher(executor_bot, storage=MemoryStorage())
 
 class SubmitOrder(StatesGroup):
     waiting_for_files = State()
 
 user_temp = {}
 
-@dp_executor.message(Command("start"))
+@dp_executor.message_handler(Command("start"))
 async def cmd_start_executor(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
@@ -643,7 +648,7 @@ async def cmd_start_executor(message: Message):
         "/help - помощь"
     )
 
-@dp_executor.message(Command("balance"))
+@dp_executor.message_handler(Command("balance"))
 async def cmd_balance_executor(message: Message):
     data = get_balance(message.from_user.id)
     if data.get("success"):
@@ -653,7 +658,7 @@ async def cmd_balance_executor(message: Message):
     else:
         await message.answer("❌ Ошибка получения баланса")
 
-@dp_executor.message(Command("feed"))
+@dp_executor.message_handler(Command("feed"))
 async def cmd_feed(message: Message):
     resp = api_request("GET", "/order/list", params={"status": "open", "limit": 10})
     if not resp.get("success"):
@@ -670,7 +675,7 @@ async def cmd_feed(message: Message):
         text = f"🔹 #{o['id']} | {o['title']}\n💰 {o['price']} баллов\n🔥 Срочность: {o['urgency']}\n📅 Снятие: {o['expires_at'][:10]}\n{o['description'][:100]}"
         await message.answer(text, reply_markup=kb)
 
-@dp_executor.callback_query(lambda c: c.data.startswith("take_"))
+@dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
 async def callback_take(callback: CallbackQuery):
     order_id = int(callback.data.split("_")[1])
     executor_id = callback.from_user.id
@@ -682,7 +687,7 @@ async def callback_take(callback: CallbackQuery):
         await callback.message.answer(f"❌ Не удалось взять: {resp.get('error')}")
     await callback.answer()
 
-@dp_executor.message(Command("take"))
+@dp_executor.message_handler(Command("take"))
 async def cmd_take(message: Message):
     args = message.text.split()
     if len(args) != 2:
@@ -699,7 +704,7 @@ async def cmd_take(message: Message):
     else:
         await message.answer(f"❌ Ошибка: {resp.get('error')}")
 
-@dp_executor.message(Command("my"))
+@dp_executor.message_handler(Command("my"))
 async def cmd_my_orders_executor(message: Message):
     tg_id = message.from_user.id
     resp = api_request("GET", "/order/list", params={"executor_id": tg_id})
@@ -715,8 +720,8 @@ async def cmd_my_orders_executor(message: Message):
         text += f"#{o['id']} | {o['title']} | {o['status']}\n"
     await message.answer(text)
 
-@dp_executor.message(Command("submit"))
-async def cmd_submit(message: Message, state: FSMContext):
+@dp_executor.message_handler(Command("submit"))
+async def cmd_submit(message: Message):
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /submit <id заказа>")
@@ -740,10 +745,10 @@ async def cmd_submit(message: Message, state: FSMContext):
         return
     
     user_temp[message.from_user.id] = order_id
-    await state.set_state(SubmitOrder.waiting_for_files)
+    await SubmitOrder.waiting_for_files.set()
     await message.answer("Пришлите файлы с результатом работы (можно несколько). Когда закончите, введите /done_files")
 
-@dp_executor.message(SubmitOrder.waiting_for_files, lambda msg: msg.document is not None)
+@dp_executor.message_handler(content_types=['document'], state=SubmitOrder.waiting_for_files)
 async def submit_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     if tg_id not in user_temp:
@@ -756,7 +761,7 @@ async def submit_files(message: Message, state: FSMContext):
     user_temp['result_files'][tg_id].append(message.document.file_id)
     await message.answer(f"Файл {message.document.file_name} добавлен. Ещё или /done_files")
 
-@dp_executor.message(SubmitOrder.waiting_for_files, Command("done_files"))
+@dp_executor.message_handler(Command("done_files"), state=SubmitOrder.waiting_for_files)
 async def finish_submit(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     order_id = user_temp.get(tg_id)
@@ -775,9 +780,9 @@ async def finish_submit(message: Message, state: FSMContext):
         del user_temp[tg_id]
     if tg_id in user_temp.get('result_files', {}):
         del user_temp['result_files'][tg_id]
-    await state.clear()
+    await state.finish()
 
-@dp_executor.message(Command("help"))
+@dp_executor.message_handler(Command("help"))
 async def cmd_help_executor(message: Message):
     await message.answer(
         "Команды исполнителя:\n"
@@ -789,11 +794,11 @@ async def cmd_help_executor(message: Message):
         "/cancel - отменить текущую операцию"
     )
 
-@dp_executor.message(Command("cancel"))
+@dp_executor.message_handler(Command("cancel"), state='*')
 async def cmd_cancel_state(message: Message, state: FSMContext):
-    await state.clear()
+    await state.finish()
     await message.answer("Отменено.")
-    
+
 @flask_app.route('/')
 def home():
     return "CAD Exchange API is running"
@@ -806,10 +811,23 @@ def run_flask():
     flask_app.run(host="0.0.0.0", port=port)
 
 async def run_bots():
-    await asyncio.gather(
-        dp_client.start_polling(client_bot),
-        dp_executor.start_polling(executor_bot)
-    )
+    # Для aiogram 2.x используем polling без await
+    from aiogram.utils.executor import start_polling
+    # Запускаем в отдельном потоке для клиентского бота
+    import threading
+    def run_client_polling():
+        from aiogram import executor
+        executor.start_polling(dp_client, skip_updates=True)
+    def run_executor_polling():
+        from aiogram import executor
+        executor.start_polling(dp_executor, skip_updates=True)
+    
+    client_thread = threading.Thread(target=run_client_polling)
+    executor_thread = threading.Thread(target=run_executor_polling)
+    client_thread.start()
+    executor_thread.start()
+    client_thread.join()
+    executor_thread.join()
 
 if __name__ == "__main__":
     threading.Thread(target=run_flask, daemon=True).start()
