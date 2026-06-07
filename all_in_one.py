@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import json
+import sys
 import asyncio
 import threading
 from datetime import datetime, timedelta
@@ -13,6 +14,10 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 from dotenv import load_dotenv
+
+# Для совместимости с Windows и старыми версиями Python
+if sys.version_info[0] == 3 and sys.version_info[1] >= 8 and sys.platform.startswith('win'):
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 load_dotenv()
 
