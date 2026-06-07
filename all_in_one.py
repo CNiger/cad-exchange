@@ -4,6 +4,7 @@ import json
 import sys
 import asyncio
 import threading
+import logging
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
@@ -15,6 +16,10 @@ from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import requests
 from dotenv import load_dotenv
+
+# Настройка логирования
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Для совместимости с Windows и старыми версиями Python
 if sys.version_info[0] == 3 and sys.version_info[1] >= 8 and sys.platform.startswith('win'):
@@ -804,31 +809,39 @@ def home():
     return "CAD Exchange API is running"
 
 # -------------------------------------------------------------------
-# 4. Запуск всех компонентов в одном процессе
+# 4. Запуск всех компонентов в одном процессе (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # -------------------------------------------------------------------
 def run_flask():
     port = int(os.getenv("PORT", 8080))
-    flask_app.run(host="0.0.0.0", port=port)
+    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
-async def run_bots():
-    # Для aiogram 2.x используем polling без await
-    from aiogram.utils.executor import start_polling
-    # Запускаем в отдельном потоке для клиентского бота
-    import threading
-    def run_client_polling():
-        from aiogram import executor
-        executor.start_polling(dp_client, skip_updates=True)
-    def run_executor_polling():
-        from aiogram import executor
-        executor.start_polling(dp_executor, skip_updates=True)
+async def run_bots_async():
+    """Асинхронный запуск обоих ботов с правильной обработкой event loop"""
+    logger.info("Запуск ботов...")
     
-    client_thread = threading.Thread(target=run_client_polling)
-    executor_thread = threading.Thread(target=run_executor_polling)
-    client_thread.start()
-    executor_thread.start()
-    client_thread.join()
-    executor_thread.join()
+    # Пропускаем старые обновления
+    await dp_client.skip_updates()
+    await dp_executor.skip_updates()
+    
+    # Запускаем обоих ботов одновременно
+    await asyncio.gather(
+        dp_client.start_polling(),
+        dp_executor.start_polling()
+    )
 
 if __name__ == "__main__":
-    threading.Thread(target=run_flask, daemon=True).start()
-    asyncio.run(run_bots())
+    logger.info("Запуск CAD Exchange платформы")
+    
+    # Запускаем Flask в отдельном потоке
+    flask_thread = threading.Thread(target=run_flask, daemon=True)
+    flask_thread.start()
+    logger.info(f"Flask сервер запущен на порту {os.getenv('PORT', 8080)}")
+    
+    # Запускаем ботов в основном потоке
+    try:
+        asyncio.run(run_bots_async())
+    except KeyboardInterrupt:
+        logger.info("Остановка приложения...")
+    except Exception as e:
+        logger.error(f"Критическая ошибка: {e}")
+        sys.exit(1)
