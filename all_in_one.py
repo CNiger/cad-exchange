@@ -7,7 +7,8 @@ import threading
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
-from aiogram import Bot, Dispatcher, types, F
+from aiogram import Bot, Dispatcher, types
+from aiogram.dispatcher.filters import Text
 from aiogram.filters import Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -522,7 +523,7 @@ async def process_days(message: Message, state: FSMContext):
         await message.answer("❌ Введите целое число дней (минимум 1)")
 
 user_files = {}
-@dp_client.message(CreateOrder.files, F.document)
+@dp_client.message(CreateOrder.files, lambda msg: msg.document is not None)
 async def process_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     file_id = message.document.file_id
@@ -742,7 +743,7 @@ async def cmd_submit(message: Message, state: FSMContext):
     await state.set_state(SubmitOrder.waiting_for_files)
     await message.answer("Пришлите файлы с результатом работы (можно несколько). Когда закончите, введите /done_files")
 
-@dp_executor.message(SubmitOrder.waiting_for_files, F.document)
+@dp_executor.message(SubmitOrder.waiting_for_files, lambda msg: msg.document is not None)
 async def submit_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     if tg_id not in user_temp:
