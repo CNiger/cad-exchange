@@ -259,14 +259,30 @@ def api_order_get():
 
 @flask_app.route("/order/take", methods=["POST"])
 def api_order_take():
-    print(f"=== /order/take called ===")
-    print(f"Headers: {dict(request.headers)}")
-    print(f"Content-Type: {request.content_type}")
-    print(f"Raw data: {request.data}")
-    print(f"JSON: {request.json}")
-    data = request.json
+    # Принудительный вывод в лог Render
+    print("=" * 50)
+    print(">>> /order/take ВЫЗВАН <<<")
+    print("=" * 50)
+    
+    # Пытаемся получить JSON любым способом
+    data = None
+    if request.is_json:
+        data = request.get_json()
+    else:
+        try:
+            import json
+            data = json.loads(request.data.decode('utf-8'))
+        except:
+            pass
+    
+    if not data:
+        print("Ошибка: Нет JSON данных")
+        return jsonify({"success": False, "error": "No JSON data"}), 400
+    
     order_id = data.get("order_id")
     executor_id = data.get("executor_id")
+    print(f"order_id={order_id}, executor_id={executor_id}")
+    
     if not order_id or not executor_id:
         return jsonify({"success": False, "error": "order_id and executor_id required"}), 400
     
@@ -295,7 +311,7 @@ def api_order_take():
     conn.commit()
     conn.close()
     send_notification(order["customer_id"], "client",
-                      f"🔧 Исполнитель @id{executor_id} взял ваш заказ №{order_id} в работу.")
+                      f"🔧 Исполнитель взял ваш заказ №{order_id} в работу.")
     return jsonify({"success": True, "data": {"status": "in_progress"}})
 
 @flask_app.route("/order/submit", methods=["POST"])
@@ -412,23 +428,24 @@ class CreateOrder(StatesGroup):
     files = State()
 
 def api_request(method, endpoint, data=None, params=None):
-    # Используем порт 10000 принудительно для Render
-    port = 10000
+    port = os.getenv("PORT", "10000")
     url = f"http://127.0.0.1:{port}{endpoint}"
-    print(f"🔍 API Request: {method} {url}")
-    print(f"🔍 Data: {data}")
-    print(f"🔍 Params: {params}")
+    print(f"🔁 {method} {url}")
+    if data:
+        print(f"   data: {data}")
     try:
         if method == "GET":
             resp = requests.get(url, params=params, timeout=10)
         else:
             resp = requests.post(url, json=data, timeout=10)
-        print(f"🔍 Response status: {resp.status_code}")
+        print(f"   response: {resp.status_code}")
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
         print(f"❌ API error: {e}")
         return {"success": False, "error": str(e)}
+
+
 
 def register_user(tg_id, username):
     return api_request("GET", "/user/get_or_create", params={"telegram_id": tg_id, "username": username})
@@ -860,7 +877,7 @@ def home():
 # 4. Запуск всех компонентов в одном процессе (ИСПРАВЛЕННАЯ ВЕРСИЯ)
 # -------------------------------------------------------------------
 def run_flask():
-    port = int(os.getenv("PORT", 8080))
+    port = int(os.getenv("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 async def run_bots_async():
