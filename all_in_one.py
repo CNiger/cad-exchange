@@ -170,6 +170,7 @@ def api_user_balance():
 
 @flask_app.route("/order/create", methods=["POST"])
 def api_order_create():
+    print("🚨 /order/create ВЫЗВАН")
     data = request.json
     required = ["customer_id", "title", "price", "days_to_live"]
     for field in required:
@@ -463,6 +464,8 @@ def create_order(customer_id, title, description, price, urgency, days_to_live, 
         "days_to_live": days_to_live,
         "files": files
     }
+    print(f"🔍 create_order URL: http://127.0.0.1:{os.getenv('PORT', '10000')}/order/create")
+    print(f"🔍 create_order data: {data}")
     return api_request("POST", "/order/create", data=data)
 
 def get_my_orders(customer_id, status=None):
