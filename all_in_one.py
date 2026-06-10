@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.filters import Command, Text, StateFilter
+from aiogram.dispatcher.filters import Command, StateFilter
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -21,7 +21,7 @@ from dotenv import load_dotenv
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Для совместимости с Windows и старыми версиями Python
+# Для совместимости с Windows
 if sys.version_info[0] == 3 and sys.version_info[1] >= 8 and sys.platform.startswith('win'):
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
@@ -35,9 +35,17 @@ EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
 DB_PATH = "cad_exchange.db"
 
 # -------------------------------------------------------------------
-# 1. Flask приложение (Core API)
+# 1. Flask приложение (только для healthcheck)
 # -------------------------------------------------------------------
 flask_app = Flask(__name__)
+
+@flask_app.route('/')
+def home():
+    return "CAD Exchange API is running"
+
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "ok", "bots_running": True})
 
 # -------------------------------------------------------------------
 # 1.1 Инициализация базы данных
@@ -45,7 +53,6 @@ flask_app = Flask(__name__)
 def init_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
-    # Таблица пользователей
     c.execute('''
         CREATE TABLE IF NOT EXISTS users (
             telegram_id INTEGER PRIMARY KEY,
@@ -55,7 +62,6 @@ def init_db():
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         )
     ''')
-    # Таблица заказов
     c.execute('''
         CREATE TABLE IF NOT EXISTS orders (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -108,26 +114,17 @@ def update_balance(telegram_id, delta):
     conn.commit()
     conn.close()
 
-# -------------------------------------------------------------------
-# 1.3 Отправка уведомлений через соответствующего бота
-# -------------------------------------------------------------------
 def send_notification(telegram_id, bot_type, text):
-    if bot_type == 'client':
-        token = CLIENT_TOKEN
-    else:
-        token = EXECUTOR_TOKEN
-    if not token or token == "заглушка":
-        print(f"Уведомление для {telegram_id} (тип {bot_type}): {text}")
+    token = CLIENT_TOKEN if bot_type == 'client' else EXECUTOR_TOKEN
+    if not token:
+        print(f"Уведомление для {telegram_id}: {text}")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(url, json={"chat_id": telegram_id, "text": text}, timeout=5)
     except Exception as e:
-        print(f"Ошибка отправки уведомления: {e}")
+        print(f"Ошибка отправки: {e}")
 
-# -------------------------------------------------------------------
-# 1.4 Планировщик: автоматическое снятие просроченных заказов
-# -------------------------------------------------------------------
 def expire_orders():
     conn = get_db_connection()
     now = datetime.utcnow().isoformat()
@@ -137,8 +134,7 @@ def expire_orders():
     ).fetchall()
     for order in expired:
         conn.execute("UPDATE orders SET status='expired' WHERE id=?", (order["id"],))
-        send_notification(order["customer_id"], "client",
-                          f"⏰ Ваш заказ №{order['id']} снят с биржи, так как никто не взял его в срок.")
+        send_notification(order["customer_id"], "client", f"⏰ Заказ №{order['id']} снят")
     conn.commit()
     conn.close()
 
@@ -147,48 +143,14 @@ scheduler.add_job(func=expire_orders, trigger="interval", hours=1)
 scheduler.start()
 
 # -------------------------------------------------------------------
-# 1.5 Эндпоинты API
+# 1.3 Логические функции ядра (без HTTP)
 # -------------------------------------------------------------------
-@flask_app.route("/user/get_or_create", methods=["GET"])
-def api_user_get_or_create():
-    telegram_id = request.args.get("telegram_id", type=int)
-    username = request.args.get("username", "")
-    if not telegram_id:
-        return jsonify({"success": False, "error": "telegram_id required"}), 400
-    user = get_user(telegram_id, username)
-    return jsonify({"success": True, "data": user})
-
-@flask_app.route("/user/balance", methods=["GET"])
-def api_user_balance():
-    telegram_id = request.args.get("telegram_id", type=int)
-    if not telegram_id:
-        return jsonify({"success": False, "error": "telegram_id required"}), 400
-    user = get_user(telegram_id)
-    if not user:
-        return jsonify({"success": False, "error": "User not found"}), 404
-    return jsonify({"success": True, "data": {"balance": user["balance"], "rating": user["rating"]}})
-
-@flask_app.route("/order/create", methods=["POST"])
-def api_order_create():
-    print("🚨 /order/create ВЫЗВАН")
-    data = request.json
-    required = ["customer_id", "title", "price", "days_to_live"]
-    for field in required:
-        if field not in data:
-            return jsonify({"success": False, "error": f"Missing {field}"}), 400
-    customer_id = data["customer_id"]
-    title = data["title"]
-    description = data.get("description", "")
-    files = json.dumps(data.get("files", []))
-    price = int(data["price"])
-    urgency = data.get("urgency", "medium")
-    days_to_live = int(data["days_to_live"])
-    
+def create_order_logic(customer_id, title, description, price, urgency, days_to_live, files):
     user = get_user(customer_id)
     if not user:
-        return jsonify({"success": False, "error": "Customer not found"}), 404
+        return {"success": False, "error": "Пользователь не найден"}
     if user["balance"] < price:
-        return jsonify({"success": False, "error": "Insufficient balance"}), 400
+        return {"success": False, "error": "Недостаточно баллов"}
     
     expires_at = (datetime.utcnow() + timedelta(days=days_to_live)).isoformat()
     conn = get_db_connection()
@@ -196,28 +158,123 @@ def api_order_create():
         '''INSERT INTO orders 
            (customer_id, title, description, files, price, urgency, days_to_live, expires_at, status)
            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')''',
-        (customer_id, title, description, files, price, urgency, days_to_live, expires_at)
+        (customer_id, title, description, json.dumps(files), price, urgency, days_to_live, expires_at)
     )
     order_id = cursor.lastrowid
     conn.commit()
     conn.close()
     update_balance(customer_id, -price)
-    return jsonify({"success": True, "data": {"order_id": order_id}})
+    return {"success": True, "order_id": order_id}
 
-@flask_app.route("/order/list", methods=["GET"])
-def api_order_list():
-    status = request.args.get("status", "open")
-    urgency = request.args.get("urgency")
-    price_min = request.args.get("price_min", type=int)
-    price_max = request.args.get("price_max", type=int)
-    customer_id = request.args.get("customer_id", type=int)
-    executor_id = request.args.get("executor_id", type=int)
-    limit = request.args.get("limit", 20, type=int)
-    offset = request.args.get("offset", 0, type=int)
+def take_order_logic(order_id, executor_id):
+    conn = get_db_connection()
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return {"success": False, "error": "Заказ не найден"}
+    if order["status"] != "open":
+        conn.close()
+        return {"success": False, "error": "Заказ уже не открыт"}
+    if order["customer_id"] == executor_id:
+        conn.close()
+        return {"success": False, "error": "Нельзя взять свой заказ"}
+    if datetime.utcnow().isoformat() > order["expires_at"]:
+        conn.execute("UPDATE orders SET status='expired' WHERE id=?", (order_id,))
+        conn.commit()
+        conn.close()
+        return {"success": False, "error": "Срок заказа истёк"}
+    
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        "UPDATE orders SET executor_id=?, status='in_progress', taken_at=? WHERE id=?",
+        (executor_id, now, order_id)
+    )
+    conn.commit()
+    conn.close()
+    send_notification(order["customer_id"], "client", f"🔧 Исполнитель взял заказ №{order_id}")
+    return {"success": True}
+
+def submit_order_logic(order_id, executor_id, result_files):
+    conn = get_db_connection()
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return {"success": False, "error": "Заказ не найден"}
+    if order["status"] != "in_progress":
+        conn.close()
+        return {"success": False, "error": "Заказ не в работе"}
+    if order["executor_id"] != executor_id:
+        conn.close()
+        return {"success": False, "error": "Вы не исполнитель"}
+    
+    now = datetime.utcnow().isoformat()
+    conn.execute(
+        "UPDATE orders SET status='completed', completed_at=?, result_files=? WHERE id=?",
+        (now, json.dumps(result_files), order_id)
+    )
+    conn.commit()
+    conn.close()
+    send_notification(order["customer_id"], "client", f"✅ Исполнитель сдал заказ №{order_id}. Примите /accept {order_id}")
+    return {"success": True}
+
+def accept_order_logic(order_id, customer_id):
+    conn = get_db_connection()
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return {"success": False, "error": "Заказ не найден"}
+    if order["status"] != "completed":
+        conn.close()
+        return {"success": False, "error": "Заказ не сдан"}
+    if order["customer_id"] != customer_id:
+        conn.close()
+        return {"success": False, "error": "Вы не заказчик"}
+    
+    executor_id = order["executor_id"]
+    reward = order["price"]
+    update_balance(executor_id, reward)
+    conn.execute("UPDATE orders SET status='closed' WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
+    send_notification(executor_id, "executor", f"🎉 Заказчик принял работу. Вам начислено {reward} баллов")
+    send_notification(customer_id, "client", f"✅ Вы приняли работу по заказу №{order_id}")
+    return {"success": True}
+
+def cancel_order_logic(order_id, user_id):
+    conn = get_db_connection()
+    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
+    if not order:
+        conn.close()
+        return {"success": False, "error": "Заказ не найден"}
+    if order["customer_id"] != user_id:
+        conn.close()
+        return {"success": False, "error": "Только заказчик может отменить"}
+    if order["status"] not in ("open", "in_progress"):
+        conn.close()
+        return {"success": False, "error": "Невозможно отменить"}
+    
+    if order["status"] == "open":
+        update_balance(user_id, order["price"])
+    if order["status"] == "in_progress" and order["executor_id"]:
+        send_notification(order["executor_id"], "executor", f"⚠️ Заказчик отменил заказ №{order_id}")
+    conn.execute("UPDATE orders SET status='cancelled' WHERE id=?", (order_id,))
+    conn.commit()
+    conn.close()
+    send_notification(user_id, "client", f"❌ Вы отменили заказ №{order_id}")
+    return {"success": True}
+
+def get_orders_logic(filters):
+    status = filters.get("status", "open")
+    urgency = filters.get("urgency")
+    price_min = filters.get("price_min")
+    price_max = filters.get("price_max")
+    customer_id = filters.get("customer_id")
+    executor_id = filters.get("executor_id")
+    limit = filters.get("limit", 20)
+    offset = filters.get("offset", 0)
 
     query = "SELECT * FROM orders WHERE 1=1"
     params = []
-    
     if status:
         query += " AND status = ?"
         params.append(status)
@@ -236,7 +293,6 @@ def api_order_list():
     if executor_id is not None:
         query += " AND executor_id = ?"
         params.append(executor_id)
-    
     query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
 
@@ -244,177 +300,10 @@ def api_order_list():
     rows = conn.execute(query, params).fetchall()
     orders = [dict(row) for row in rows]
     conn.close()
-    return jsonify({"success": True, "data": orders})
-
-@flask_app.route("/order/get", methods=["GET"])
-def api_order_get():
-    order_id = request.args.get("id", type=int)
-    if not order_id:
-        return jsonify({"success": False, "error": "id required"}), 400
-    conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    conn.close()
-    if not order:
-        return jsonify({"success": False, "error": "Order not found"}), 404
-    return jsonify({"success": True, "data": dict(order)})
-
-@flask_app.route("/order/take", methods=["POST"])
-def api_order_take():
-    # Принудительный вывод в лог Render
-    print("=" * 50)
-    print(">>> /order/take ВЫЗВАН <<<")
-    print("=" * 50)
-    
-    # Пытаемся получить JSON любым способом
-    data = None
-    if request.is_json:
-        data = request.get_json()
-    else:
-        try:
-            import json
-            data = json.loads(request.data.decode('utf-8'))
-        except:
-            pass
-    
-    if not data:
-        print("Ошибка: Нет JSON данных")
-        return jsonify({"success": False, "error": "No JSON data"}), 400
-    
-    order_id = data.get("order_id")
-    executor_id = data.get("executor_id")
-    print(f"order_id={order_id}, executor_id={executor_id}")
-    
-    if not order_id or not executor_id:
-        return jsonify({"success": False, "error": "order_id and executor_id required"}), 400
-    
-    conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return jsonify({"success": False, "error": "Order not found"}), 404
-    if order["status"] != "open":
-        conn.close()
-        return jsonify({"success": False, "error": "Order is not open"}), 400
-    if order["customer_id"] == executor_id:
-        conn.close()
-        return jsonify({"success": False, "error": "Cannot take your own order"}), 400
-    if datetime.utcnow().isoformat() > order["expires_at"]:
-        conn.execute("UPDATE orders SET status='expired' WHERE id=?", (order_id,))
-        conn.commit()
-        conn.close()
-        return jsonify({"success": False, "error": "Order expired"}), 400
-    
-    now = datetime.utcnow().isoformat()
-    conn.execute(
-        "UPDATE orders SET executor_id=?, status='in_progress', taken_at=? WHERE id=?",
-        (executor_id, now, order_id)
-    )
-    conn.commit()
-    conn.close()
-    send_notification(order["customer_id"], "client",
-                      f"🔧 Исполнитель взял ваш заказ №{order_id} в работу.")
-    return jsonify({"success": True, "data": {"status": "in_progress"}})
-
-@flask_app.route("/order/submit", methods=["POST"])
-def api_order_submit():
-    data = request.json
-    order_id = data.get("order_id")
-    executor_id = data.get("executor_id")
-    result_files = json.dumps(data.get("result_files", []))
-    if not order_id or not executor_id:
-        return jsonify({"success": False, "error": "order_id and executor_id required"}), 400
-    
-    conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return jsonify({"success": False, "error": "Order not found"}), 404
-    if order["status"] != "in_progress":
-        conn.close()
-        return jsonify({"success": False, "error": "Order is not in progress"}), 400
-    if order["executor_id"] != executor_id:
-        conn.close()
-        return jsonify({"success": False, "error": "You are not the executor"}), 403
-    
-    now = datetime.utcnow().isoformat()
-    conn.execute(
-        "UPDATE orders SET status='completed', completed_at=?, result_files=? WHERE id=?",
-        (now, result_files, order_id)
-    )
-    conn.commit()
-    conn.close()
-    send_notification(order["customer_id"], "client",
-                      f"✅ Исполнитель сдал работу по заказу №{order_id}. Для подтверждения используйте /accept {order_id}")
-    return jsonify({"success": True, "data": {"status": "completed"}})
-
-@flask_app.route("/order/accept", methods=["POST"])
-def api_order_accept():
-    data = request.json
-    order_id = data.get("order_id")
-    customer_id = data.get("customer_id")
-    if not order_id or not customer_id:
-        return jsonify({"success": False, "error": "order_id and customer_id required"}), 400
-    
-    conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return jsonify({"success": False, "error": "Order not found"}), 404
-    if order["status"] != "completed":
-        conn.close()
-        return jsonify({"success": False, "error": "Order is not completed"}), 400
-    if order["customer_id"] != customer_id:
-        conn.close()
-        return jsonify({"success": False, "error": "You are not the customer"}), 403
-    
-    executor_id = order["executor_id"]
-    reward = order["price"]
-    update_balance(executor_id, reward)
-    conn.execute("UPDATE orders SET status='closed' WHERE id=?", (order_id,))
-    conn.commit()
-    conn.close()
-    
-    send_notification(executor_id, "executor",
-                      f"🎉 Заказчик принял вашу работу по заказу №{order_id}. Вам начислено {reward} баллов.")
-    send_notification(customer_id, "client",
-                      f"✅ Вы приняли работу по заказу №{order_id}. Спасибо за использование биржи!")
-    return jsonify({"success": True, "data": {"status": "closed"}})
-
-@flask_app.route("/order/cancel", methods=["POST"])
-def api_order_cancel():
-    data = request.json
-    order_id = data.get("order_id")
-    user_id = data.get("user_id")
-    if not order_id or not user_id:
-        return jsonify({"success": False, "error": "order_id and user_id required"}), 400
-    
-    conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return jsonify({"success": False, "error": "Order not found"}), 404
-    if order["customer_id"] != user_id:
-        conn.close()
-        return jsonify({"success": False, "error": "Only customer can cancel"}), 403
-    if order["status"] not in ("open", "in_progress"):
-        conn.close()
-        return jsonify({"success": False, "error": "Cannot cancel order in current status"}), 400
-    
-    old_status = order["status"]
-    if old_status == "open":
-        update_balance(user_id, order["price"])
-    if old_status == "in_progress" and order["executor_id"]:
-        send_notification(order["executor_id"], "executor",
-                          f"⚠️ Заказчик отменил заказ №{order_id}, который вы выполняли.")
-    
-    conn.execute("UPDATE orders SET status='cancelled' WHERE id=?", (order_id,))
-    conn.commit()
-    conn.close()
-    send_notification(user_id, "client", f"❌ Вы отменили заказ №{order_id}.")
-    return jsonify({"success": True, "data": {"status": "cancelled"}})
+    return {"success": True, "data": orders}
 
 # -------------------------------------------------------------------
-# 2. Client Bot (aiogram 2.x)
+# 2. Client Bot
 # -------------------------------------------------------------------
 storage = MemoryStorage()
 client_bot = Bot(token=CLIENT_TOKEN)
@@ -428,82 +317,23 @@ class CreateOrder(StatesGroup):
     days = State()
     files = State()
 
-def api_request(method, endpoint, data=None, params=None):
-    port = os.getenv("PORT", "10000")
-    url = f"http://127.0.0.1:{port}{endpoint}"
-    print(f"🔁 {method} {url}")
-    if data:
-        print(f"   data: {data}")
-    try:
-        if method == "GET":
-            resp = requests.get(url, params=params, timeout=10)
-        else:
-            resp = requests.post(url, json=data, timeout=10)
-        print(f"   response: {resp.status_code}")
-        resp.raise_for_status()
-        return resp.json()
-    except Exception as e:
-        print(f"❌ API error: {e}")
-        return {"success": False, "error": str(e)}
-
-
-
-def register_user(tg_id, username):
-    return api_request("GET", "/user/get_or_create", params={"telegram_id": tg_id, "username": username})
-
-def get_balance(tg_id):
-    return api_request("GET", "/user/balance", params={"telegram_id": tg_id})
-
-def create_order(customer_id, title, description, price, urgency, days_to_live, files):
-    data = {
-        "customer_id": customer_id,
-        "title": title,
-        "description": description,
-        "price": price,
-        "urgency": urgency,
-        "days_to_live": days_to_live,
-        "files": files
-    }
-    print(f"🔍 create_order URL: http://127.0.0.1:{os.getenv('PORT', '10000')}/order/create")
-    print(f"🔍 create_order data: {data}")
-    return api_request("POST", "/order/create", data=data)
-
-def get_my_orders(customer_id, status=None):
-    return api_request("GET", "/order/list", params={"customer_id": customer_id, "status": status})
-
-def accept_order(order_id, customer_id):
-    return api_request("POST", "/order/accept", data={"order_id": order_id, "customer_id": customer_id})
-
-def cancel_order(order_id, user_id):
-    return api_request("POST", "/order/cancel", data={"order_id": order_id, "user_id": user_id})
+user_files = {}
 
 @dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
-    register_user(tg_id, username)
-    balance_data = get_balance(tg_id)
-    balance = balance_data.get("data", {}).get("balance", 0) if balance_data.get("success") else 0
+    get_user(tg_id, username)
+    balance_data = get_user(tg_id)["balance"]
     await message.answer(
-        f"🏗️ Добро пожаловать в биржу CAD (клиентский бот)!\n"
-        f"Ваш баланс: {balance} баллов\n\n"
-        "Команды:\n"
-        "/new - создать заказ\n"
-        "/my_orders - мои заказы\n"
-        "/balance - проверить баланс\n"
-        "/help - помощь"
+        f"🏗️ Добро пожаловать в биржу CAD (клиент)!\nВаш баланс: {balance_data} баллов\n\n"
+        "/new - создать заказ\n/my_orders - мои заказы\n/balance - баланс\n/help - помощь"
     )
 
 @dp_client.message_handler(Command("balance"))
 async def cmd_balance(message: Message):
-    tg_id = message.from_user.id
-    data = get_balance(tg_id)
-    if data.get("success"):
-        bal = data["data"]["balance"]
-        rating = data["data"]["rating"]
-        await message.answer(f"💰 Ваш баланс: {bal} баллов\n⭐ Рейтинг: {rating}")
-    else:
-        await message.answer("❌ Не удалось получить баланс")
+    user = get_user(message.from_user.id)
+    await message.answer(f"💰 Баланс: {user['balance']} баллов\n⭐ Рейтинг: {user['rating']}")
 
 @dp_client.message_handler(Command("new"))
 async def cmd_new(message: Message):
@@ -515,14 +345,14 @@ async def process_title(message: Message, state: FSMContext):
     async with state.proxy() as data:
         data['title'] = message.text
     await CreateOrder.next()
-    await message.answer("Введите описание задачи:")
+    await message.answer("Введите описание:")
 
 @dp_client.message_handler(state=CreateOrder.description)
 async def process_description(message: Message, state: FSMContext):
     async with state.proxy() as data:
         data['description'] = message.text
     await CreateOrder.next()
-    await message.answer("Укажите цену в баллах (целое число):")
+    await message.answer("Укажите цену в баллах:")
 
 @dp_client.message_handler(state=CreateOrder.price)
 async def process_price(message: Message, state: FSMContext):
@@ -540,14 +370,14 @@ async def process_price(message: Message, state: FSMContext):
         await CreateOrder.next()
         await message.answer("Выберите срочность:", reply_markup=kb)
     except:
-        await message.answer("❌ Введите целое положительное число.")
+        await message.answer("❌ Введите положительное число")
 
 @dp_client.callback_query_handler(lambda c: c.data in ['low', 'medium', 'high'], state=CreateOrder.urgency)
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['urgency'] = callback.data
     await CreateOrder.next()
-    await callback.message.answer("Через сколько дней снять заказ с биржи, если не возьмут? (введите число дней, например 7)")
+    await callback.message.answer("Через сколько дней снять заказ? (число дней)")
     await callback.answer()
 
 @dp_client.message_handler(state=CreateOrder.days)
@@ -559,50 +389,44 @@ async def process_days(message: Message, state: FSMContext):
         async with state.proxy() as data:
             data['days'] = days
         await CreateOrder.next()
-        await message.answer("Приложите файлы к заданию (можно несколько, после отправки нажмите /done). Для завершения загрузки введите /done")
+        await message.answer("Приложите файлы. После всех файлов введите /done")
     except:
-        await message.answer("❌ Введите целое число дней (минимум 1)")
+        await message.answer("❌ Введите число больше 0")
 
-user_files = {}
 @dp_client.message_handler(content_types=['document'], state=CreateOrder.files)
 async def process_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
-    file_id = message.document.file_id
     if tg_id not in user_files:
         user_files[tg_id] = []
-    user_files[tg_id].append(file_id)
-    await message.answer(f"Файл {message.document.file_name} добавлен. Можно добавить ещё или введите /done")
+    user_files[tg_id].append(message.document.file_id)
+    await message.answer(f"Файл добавлен. Ещё или /done")
 
 @dp_client.message_handler(Command("done"), state=CreateOrder.files)
 async def finish_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
     files = user_files.get(tg_id, [])
     data = await state.get_data()
-    resp = create_order(tg_id, data['title'], data['description'], data['price'], data['urgency'], data['days'], files)
-    if resp.get("success"):
-        order_id = resp["data"]["order_id"]
-        await message.answer(f"✅ Заказ №{order_id} создан! Списано {data['price']} баллов.")
+    result = create_order_logic(
+        tg_id, data['title'], data['description'], data['price'],
+        data['urgency'], data['days'], files
+    )
+    if result.get("success"):
+        await message.answer(f"✅ Заказ №{result['order_id']} создан! Списано {data['price']} баллов.")
     else:
-        await message.answer(f"❌ Ошибка: {resp.get('error')}")
+        await message.answer(f"❌ Ошибка: {result.get('error')}")
     if tg_id in user_files:
         del user_files[tg_id]
     await state.finish()
 
-@dp_client.message_handler(Command("cancel"), state='*')
-async def cancel_cmd(message: Message, state: FSMContext):
-    await state.finish()
-    await message.answer("Создание заказа отменено.")
-
 @dp_client.message_handler(Command("my_orders"))
 async def cmd_my_orders(message: Message):
-    tg_id = message.from_user.id
-    resp = get_my_orders(tg_id)
-    if not resp.get("success"):
-        await message.answer("❌ Не удалось получить заказы")
+    result = get_orders_logic({"customer_id": message.from_user.id})
+    if not result.get("success"):
+        await message.answer("❌ Ошибка")
         return
-    orders = resp.get("data", [])
+    orders = result.get("data", [])
     if not orders:
-        await message.answer("У вас пока нет заказов.")
+        await message.answer("У вас нет заказов.")
         return
     text = "📋 Ваши заказы:\n"
     for o in orders:
@@ -613,52 +437,21 @@ async def cmd_my_orders(message: Message):
 async def cmd_accept(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("Использование: /accept <ID заказа>")
+        await message.answer("Использование: /accept <ID>")
         return
     try:
         order_id = int(args[1])
     except:
         await message.answer("ID должно быть числом")
         return
-    tg_id = message.from_user.id
-    resp = accept_order(order_id, tg_id)
-    if resp.get("success"):
-        await message.answer(f"✅ Заказ #{order_id} принят, баллы начислены исполнителю.")
+    result = accept_order_logic(order_id, message.from_user.id)
+    if result.get("success"):
+        await message.answer(f"✅ Заказ #{order_id} принят")
     else:
-        await message.answer(f"❌ Ошибка: {resp.get('error')}")
-
-@dp_client.message_handler(Command("cancel_order"))
-async def cmd_cancel_order(message: Message):
-    args = message.text.split()
-    if len(args) != 2:
-        await message.answer("Использование: /cancel_order <ID заказа>")
-        return
-    try:
-        order_id = int(args[1])
-    except:
-        await message.answer("ID должно быть числом")
-        return
-    tg_id = message.from_user.id
-    resp = cancel_order(order_id, tg_id)
-    if resp.get("success"):
-        await message.answer(f"❌ Заказ #{order_id} отменён.")
-    else:
-        await message.answer(f"❌ Ошибка: {resp.get('error')}")
-
-@dp_client.message_handler(Command("help"))
-async def cmd_help(message: Message):
-    await message.answer(
-        "Команды бота заказчика:\n"
-        "/new - создать новый заказ\n"
-        "/my_orders - список моих заказов\n"
-        "/accept <id> - принять выполненный заказ\n"
-        "/cancel_order <id> - отменить заказ\n"
-        "/balance - баланс\n"
-        "/cancel - отменить создание заказа"
-    )
+        await message.answer(f"❌ {result.get('error')}")
 
 # -------------------------------------------------------------------
-# 3. Executor Bot (aiogram 2.x)
+# 3. Executor Bot
 # -------------------------------------------------------------------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
 dp_executor = Dispatcher(executor_bot, storage=MemoryStorage())
@@ -672,92 +465,43 @@ user_temp = {}
 async def cmd_start_executor(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
-    register_user(tg_id, username)
+    get_user(tg_id, username)
     await message.answer(
-        "👷 Добро пожаловать в биржу CAD (исполнитель)!\n"
-        "Команды:\n"
-        "/feed - показать открытые заказы (с фильтрами)\n"
-        "/take <id> - взять заказ\n"
-        "/my - мои текущие заказы\n"
-        "/submit <id> - сдать выполненный заказ\n"
-        "/balance - баланс\n"
-        "/help - помощь"
+        "👷 Биржа CAD (исполнитель)!\n"
+        "/feed - заказы\n/take <id> - взять\n/my - мои заказы\n/submit <id> - сдать\n/balance - баланс"
     )
 
 @dp_executor.message_handler(Command("balance"))
 async def cmd_balance_executor(message: Message):
-    data = get_balance(message.from_user.id)
-    if data.get("success"):
-        bal = data["data"]["balance"]
-        rating = data["data"]["rating"]
-        await message.answer(f"💰 Ваш баланс: {bal} баллов\n⭐ Рейтинг: {rating}")
-    else:
-        await message.answer("❌ Ошибка получения баланса")
+    user = get_user(message.from_user.id)
+    await message.answer(f"💰 Баланс: {user['balance']} баллов")
 
 @dp_executor.message_handler(Command("feed"))
 async def cmd_feed(message: Message):
-    resp = api_request("GET", "/order/list", params={"status": "open", "limit": 10})
-    if not resp.get("success"):
-        await message.answer("❌ Ошибка получения списка")
+    result = get_orders_logic({"status": "open", "limit": 10})
+    if not result.get("success"):
+        await message.answer("❌ Ошибка")
         return
-    orders = resp.get("data", [])
+    orders = result.get("data", [])
     if not orders:
         await message.answer("Нет открытых заказов.")
         return
     for o in orders:
-        # Проверяем наличие файлов
-        has_files = o.get('files') and o['files'] != '[]'
-        files_indicator = " 📎" if has_files else ""
-        
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{o['id']}")]
         ])
-        # Добавляем кнопку просмотра файлов, если они есть
-        if has_files:
-            kb.inline_keyboard.append([InlineKeyboardButton(text="📎 Посмотреть файлы", callback_data=f"files_{o['id']}")])
-        
-        text = f"🔹 #{o['id']} | {o['title']}{files_indicator}\n💰 {o['price']} баллов\n🔥 Срочность: {o['urgency']}\n📅 Снятие: {o['expires_at'][:10]}\n📝 {o['description'][:100]}"
+        text = f"🔹 #{o['id']} | {o['title']}\n💰 {o['price']} баллов\n🔥 {o['urgency']}\n📅 до {o['expires_at'][:10]}"
         await message.answer(text, reply_markup=kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
 async def callback_take(callback: CallbackQuery):
     order_id = int(callback.data.split("_")[1])
-    executor_id = callback.from_user.id
-    resp = api_request("POST", "/order/take", data={"order_id": order_id, "executor_id": executor_id})
-    if resp.get("success"):
-        await callback.message.answer(f"✅ Вы взяли заказ #{order_id} в работу.")
+    result = take_order_logic(order_id, callback.from_user.id)
+    if result.get("success"):
+        await callback.message.answer(f"✅ Вы взяли заказ #{order_id}")
         await callback.message.edit_reply_markup(reply_markup=None)
     else:
-        await callback.message.answer(f"❌ Не удалось взять: {resp.get('error')}")
-    await callback.answer()
-
-@dp_executor.callback_query_handler(lambda c: c.data.startswith("files_"))
-async def callback_show_files(callback: CallbackQuery):
-    order_id = int(callback.data.split("_")[1])
-    order_resp = api_request("GET", "/order/get", params={"id": order_id})
-    if not order_resp.get("success"):
-        await callback.message.answer("❌ Не удалось получить файлы")
-        await callback.answer()
-        return
-    
-    order_data = order_resp.get("data", {})
-    files_json = order_data.get("files", "[]")
-    try:
-        files = json.loads(files_json)
-    except:
-        files = []
-    
-    if not files:
-        await callback.message.answer("📭 Файлы не прикреплены")
-        await callback.answer()
-        return
-    
-    await callback.message.answer(f"📎 Файлы к заказу #{order_id}:")
-    for file_id in files:
-        try:
-            await callback.message.answer_document(file_id)
-        except Exception as e:
-            await callback.message.answer(f"❌ Не удалось отправить файл: {e}")
+        await callback.message.answer(f"❌ {result.get('error')}")
     await callback.answer()
 
 @dp_executor.message_handler(Command("take"))
@@ -771,20 +515,16 @@ async def cmd_take(message: Message):
     except:
         await message.answer("ID должно быть числом")
         return
-    resp = api_request("POST", "/order/take", data={"order_id": order_id, "executor_id": message.from_user.id})
-    if resp.get("success"):
-        await message.answer(f"✅ Вы взяли заказ #{order_id}.")
+    result = take_order_logic(order_id, message.from_user.id)
+    if result.get("success"):
+        await message.answer(f"✅ Вы взяли заказ #{order_id}")
     else:
-        await message.answer(f"❌ Ошибка: {resp.get('error')}")
+        await message.answer(f"❌ {result.get('error')}")
 
 @dp_executor.message_handler(Command("my"))
 async def cmd_my_orders_executor(message: Message):
-    tg_id = message.from_user.id
-    resp = api_request("GET", "/order/list", params={"executor_id": tg_id})
-    if not resp.get("success"):
-        await message.answer("Ошибка")
-        return
-    orders = resp.get("data", [])
+    result = get_orders_logic({"executor_id": message.from_user.id})
+    orders = result.get("data", [])
     if not orders:
         await message.answer("У вас нет взятых заказов.")
         return
@@ -797,7 +537,7 @@ async def cmd_my_orders_executor(message: Message):
 async def cmd_submit(message: Message):
     args = message.text.split()
     if len(args) != 2:
-        await message.answer("Использование: /submit <id заказа>")
+        await message.answer("Использование: /submit <id>")
         return
     try:
         order_id = int(args[1])
@@ -805,34 +545,32 @@ async def cmd_submit(message: Message):
         await message.answer("ID должно быть числом")
         return
     
-    order = api_request("GET", "/order/get", params={"id": order_id})
-    if not order.get("success"):
+    # Проверяем, что заказ принадлежит исполнителю и в работе
+    orders_result = get_orders_logic({"id": order_id})
+    if not orders_result.get("success"):
         await message.answer("❌ Заказ не найден")
         return
-    order_data = order["data"]
-    if order_data["executor_id"] != message.from_user.id:
-        await message.answer("❌ Вы не исполнитель этого заказа")
+    order = orders_result["data"][0]
+    if order.get("executor_id") != message.from_user.id:
+        await message.answer("❌ Вы не исполнитель")
         return
-    if order_data["status"] != "in_progress":
-        await message.answer("❌ Заказ не в статусе 'в работе'")
+    if order.get("status") != "in_progress":
+        await message.answer("❌ Заказ не в работе")
         return
     
     user_temp[message.from_user.id] = order_id
     await SubmitOrder.waiting_for_files.set()
-    await message.answer("Пришлите файлы с результатом работы (можно несколько). Когда закончите, введите /done_files")
+    await message.answer("Пришлите файлы, затем /done_files")
 
 @dp_executor.message_handler(content_types=['document'], state=SubmitOrder.waiting_for_files)
 async def submit_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
-    if tg_id not in user_temp:
-        await message.answer("Начните с /submit")
-        return
     if 'result_files' not in user_temp:
         user_temp['result_files'] = {}
     if tg_id not in user_temp['result_files']:
         user_temp['result_files'][tg_id] = []
     user_temp['result_files'][tg_id].append(message.document.file_id)
-    await message.answer(f"Файл {message.document.file_name} добавлен. Ещё или /done_files")
+    await message.answer(f"Файл добавлен. Ещё или /done_files")
 
 @dp_executor.message_handler(Command("done_files"), state=SubmitOrder.waiting_for_files)
 async def finish_submit(message: Message, state: FSMContext):
@@ -840,82 +578,45 @@ async def finish_submit(message: Message, state: FSMContext):
     order_id = user_temp.get(tg_id)
     files = user_temp.get('result_files', {}).get(tg_id, [])
     if not order_id:
-        await message.answer("Ошибка: не найден заказ. Повторите /submit")
+        await message.answer("Ошибка. Повторите /submit")
         return
-    
-    resp = api_request("POST", "/order/submit", data={"order_id": order_id, "executor_id": tg_id, "result_files": files})
-    if resp.get("success"):
-        await message.answer(f"✅ Решение по заказу #{order_id} отправлено заказчику.")
+    result = submit_order_logic(order_id, tg_id, files)
+    if result.get("success"):
+        await message.answer(f"✅ Решение по заказу #{order_id} отправлено")
     else:
-        await message.answer(f"❌ Ошибка: {resp.get('error')}")
-    
-    if tg_id in user_temp:
-        del user_temp[tg_id]
+        await message.answer(f"❌ {result.get('error')}")
+    del user_temp[tg_id]
     if tg_id in user_temp.get('result_files', {}):
         del user_temp['result_files'][tg_id]
     await state.finish()
 
-@dp_executor.message_handler(Command("help"))
-async def cmd_help_executor(message: Message):
-    await message.answer(
-        "Команды исполнителя:\n"
-        "/feed - список открытых заказов\n"
-        "/take <id> - взять заказ\n"
-        "/my - мои текущие заказы\n"
-        "/submit <id> - сдать решение\n"
-        "/balance - баланс\n"
-        "/cancel - отменить текущую операцию"
-    )
-
-@dp_executor.message_handler(Command("cancel"), state='*')
-async def cmd_cancel_state(message: Message, state: FSMContext):
-    await state.finish()
-    await message.answer("Отменено.")
-
-@flask_app.route('/')
-def home():
-    return "CAD Exchange API is running"
-
 # -------------------------------------------------------------------
-# 4. Запуск всех компонентов в одном процессе (ИСПРАВЛЕННАЯ ВЕРСИЯ)
+# 4. Запуск всех компонентов
 # -------------------------------------------------------------------
 def run_flask():
     port = int(os.getenv("PORT", 10000))
     flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
 
 async def run_bots_async():
-    """Асинхронный запуск обоих ботов с правильной обработкой event loop"""
     logger.info("Запуск ботов...")
-    
-    # Пропускаем старые обновления
+    await dp_client.bot.delete_webhook()
+    await dp_executor.bot.delete_webhook()
     await dp_client.skip_updates()
     await dp_executor.skip_updates()
-    
-    # Запускаем обоих ботов одновременно
     await asyncio.gather(
         dp_client.start_polling(),
         dp_executor.start_polling()
     )
 
-# Вывод всех зарегистрированных маршрутов для отладки
-print("\n=== ЗАРЕГИСТРИРОВАННЫЕ МАРШРУТЫ ===")
-for rule in flask_app.url_map.iter_rules():
-    print(f"{rule.endpoint}: {list(rule.methods)} {rule}")
-print("=====================================\n")
-
 if __name__ == "__main__":
     logger.info("Запуск CAD Exchange платформы")
-    
-    # Запускаем Flask в отдельном потоке
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
-    logger.info(f"Flask сервер запущен на порту {os.getenv('PORT', 8080)}")
-    
-    # Запускаем ботов в основном потоке
+    logger.info(f"Flask запущен на порту {os.getenv('PORT', 10000)}")
     try:
         asyncio.run(run_bots_async())
     except KeyboardInterrupt:
-        logger.info("Остановка приложения...")
+        logger.info("Остановка...")
     except Exception as e:
-        logger.error(f"Критическая ошибка: {e}")
+        logger.error(f"Ошибка: {e}")
         sys.exit(1)
