@@ -315,18 +315,16 @@ class CreateOrder(StatesGroup):
     price = State()
     urgency = State()
     days = State()
-    files = State()
-
-user_files = {}
+    files = State()  # теперь храним список файлов прямо в state
 
 @dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
     get_user(tg_id, username)
-    balance_data = get_user(tg_id)["balance"]
+    user = get_user(tg_id)
     await message.answer(
-        f"🏗️ Добро пожаловать в биржу CAD (клиент)!\nВаш баланс: {balance_data} баллов\n\n"
+        f"🏗️ Добро пожаловать в биржу CAD (клиент)!\nВаш баланс: {user['balance']} баллов\n\n"
         "/new - создать заказ\n/my_orders - мои заказы\n/balance - баланс\n/help - помощь"
     )
 
@@ -344,6 +342,7 @@ async def cmd_new(message: Message):
 async def process_title(message: Message, state: FSMContext):
     async with state.proxy() as data:
         data['title'] = message.text
+        data['files'] = []  # инициализируем список файлов
     await CreateOrder.next()
     await message.answer("Введите описание:")
 
@@ -377,7 +376,7 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     async with state.proxy() as data:
         data['urgency'] = callback.data
     await CreateOrder.next()
-    await callback.message.answer("Через сколько дней снять заказ? (число дней)")
+    await callback.message.answer("Через сколько дней снять заказ? (введите число дней)")
     await callback.answer()
 
 @dp_client.message_handler(state=CreateOrder.days)
@@ -389,34 +388,55 @@ async def process_days(message: Message, state: FSMContext):
         async with state.proxy() as data:
             data['days'] = days
         await CreateOrder.next()
-        await message.answer("Приложите файлы. После всех файлов введите /done")
+        await message.answer("📎 Присылайте файлы. Когда закончите, введите /done")
     except:
         await message.answer("❌ Введите число больше 0")
 
+# Обработчик файлов — сохраняем file_id в state
 @dp_client.message_handler(content_types=['document'], state=CreateOrder.files)
 async def process_files(message: Message, state: FSMContext):
-    tg_id = message.from_user.id
-    if tg_id not in user_files:
-        user_files[tg_id] = []
-    user_files[tg_id].append(message.document.file_id)
-    await message.answer(f"Файл добавлен. Ещё или /done")
+    async with state.proxy() as data:
+        if 'files' not in data:
+            data['files'] = []
+        data['files'].append(message.document.file_id)
+    await message.answer(f"✅ Файл {message.document.file_name} добавлен. Ещё или /done")
 
+# Команда /done — завершаем создание заказа
 @dp_client.message_handler(Command("done"), state=CreateOrder.files)
 async def finish_files(message: Message, state: FSMContext):
-    tg_id = message.from_user.id
-    files = user_files.get(tg_id, [])
     data = await state.get_data()
+    files = data.get('files', [])
+    
+    # Проверяем обязательные поля
+    required_fields = ['title', 'description', 'price', 'urgency', 'days']
+    for field in required_fields:
+        if field not in data:
+            await message.answer(f"❌ Ошибка: не заполнено поле {field}. Попробуйте /new заново")
+            await state.finish()
+            return
+    
     result = create_order_logic(
-        tg_id, data['title'], data['description'], data['price'],
-        data['urgency'], data['days'], files
+        message.from_user.id,
+        data['title'],
+        data['description'],
+        data['price'],
+        data['urgency'],
+        data['days'],
+        files
     )
+    
     if result.get("success"):
         await message.answer(f"✅ Заказ №{result['order_id']} создан! Списано {data['price']} баллов.")
     else:
         await message.answer(f"❌ Ошибка: {result.get('error')}")
-    if tg_id in user_files:
-        del user_files[tg_id]
+    
     await state.finish()
+
+# Отмена создания заказа
+@dp_client.message_handler(Command("cancel"), state='*')
+async def cancel_cmd(message: Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Создание заказа отменено.")
 
 @dp_client.message_handler(Command("my_orders"))
 async def cmd_my_orders(message: Message):
@@ -449,6 +469,35 @@ async def cmd_accept(message: Message):
         await message.answer(f"✅ Заказ #{order_id} принят")
     else:
         await message.answer(f"❌ {result.get('error')}")
+
+@dp_client.message_handler(Command("cancel_order"))
+async def cmd_cancel_order(message: Message):
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Использование: /cancel_order <ID>")
+        return
+    try:
+        order_id = int(args[1])
+    except:
+        await message.answer("ID должно быть числом")
+        return
+    result = cancel_order_logic(order_id, message.from_user.id)
+    if result.get("success"):
+        await message.answer(f"❌ Заказ #{order_id} отменён")
+    else:
+        await message.answer(f"❌ {result.get('error')}")
+
+@dp_client.message_handler(Command("help"))
+async def cmd_help(message: Message):
+    await message.answer(
+        "Команды заказчика:\n"
+        "/new - создать заказ\n"
+        "/my_orders - мои заказы\n"
+        "/accept <id> - принять работу\n"
+        "/cancel_order <id> - отменить заказ\n"
+        "/balance - баланс\n"
+        "/cancel - отменить создание заказа"
+    )
 
 # -------------------------------------------------------------------
 # 3. Executor Bot
