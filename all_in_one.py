@@ -104,6 +104,7 @@ def get_user(telegram_id, username=None):
                 c.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
                 user = c.fetchone()
     conn.close()
+    # Преобразуем RealDictRow в обычный dict, если это не None
     return dict(user) if user else None
 
 def update_balance(telegram_id, delta):
