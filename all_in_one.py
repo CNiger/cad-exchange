@@ -37,8 +37,7 @@ if not DATABASE_URL:
 # 1. Подключение к PostgreSQL
 # -------------------------------------------------------------------
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL)
-    conn.row_factory = psycopg2.extras.RealDictCursor
+    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
     return conn
 
 def init_db():
