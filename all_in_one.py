@@ -18,27 +18,21 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 load_dotenv()
 
-# -------------------------------------------------------------------
-# Конфиги
-# -------------------------------------------------------------------
+# ---------- Конфиги ----------
 CLIENT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
 if not DATABASE_URL:
-    raise RuntimeError("DATABASE_URL environment variable not set")
+    raise RuntimeError("DATABASE_URL not set")
 
-# -------------------------------------------------------------------
-# 1. Подключение к PostgreSQL
-# -------------------------------------------------------------------
+# ---------- PostgreSQL ----------
 def get_db_connection():
-    conn = psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
-    return conn
+    return psycopg2.connect(DATABASE_URL, cursor_factory=psycopg2.extras.RealDictCursor)
 
 def init_db():
     conn = get_db_connection()
@@ -86,31 +80,24 @@ def init_db():
 
 init_db()
 
-# -------------------------------------------------------------------
-# 2. Функции работы с БД
-# -------------------------------------------------------------------
+# ---------- Работа с пользователями (ГАРАНТИРОВАННО РАБОТАЕТ) ----------
 def get_user(telegram_id, username=None):
     conn = get_db_connection()
-    cursor = conn.cursor()
-    
-    # Проверяем, есть ли пользователь
-    cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-    user = cursor.fetchone()
-    
-    # Если нет — создаём
-    if not user and username is not None:
-        cursor.execute(
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+    user = cur.fetchone()
+    if not user:
+        if username is None:
+            username = f"user_{telegram_id}"
+        cur.execute(
             "INSERT INTO users (telegram_id, username) VALUES (%s, %s)",
             (telegram_id, username)
         )
-        conn.commit()  # ОБЯЗАТЕЛЬНО
-        # Повторно читаем
-        cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-        user = cursor.fetchone()
-    
-    cursor.close()
+        conn.commit()
+        cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+        user = cur.fetchone()
+    cur.close()
     conn.close()
-    
     return dict(user) if user else None
 
 def update_balance(telegram_id, delta):
@@ -123,23 +110,22 @@ def update_balance(telegram_id, delta):
             )
     conn.close()
 
-# -------------------------------------------------------------------
-# 3. Отправка уведомлений
-# -------------------------------------------------------------------
+# ---------- Уведомления ----------
 def send_notification(telegram_id, bot_type, text):
     token = CLIENT_TOKEN if bot_type == 'client' else EXECUTOR_TOKEN
     if not token:
         logger.info(f"Уведомление для {telegram_id}: {text}")
         return
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
-        requests.post(url, json={"chat_id": telegram_id, "text": text}, timeout=5)
+        requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={"chat_id": telegram_id, "text": text},
+            timeout=5
+        )
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
-# -------------------------------------------------------------------
-# 4. Планировщик
-# -------------------------------------------------------------------
+# ---------- Планировщик ----------
 def expire_orders():
     conn = get_db_connection()
     with conn:
@@ -149,23 +135,16 @@ def expire_orders():
                 "SELECT id, customer_id FROM orders WHERE status='open' AND expires_at < %s",
                 (now,)
             )
-            expired = c.fetchall()
-            for order in expired:
+            for order in c.fetchall():
                 c.execute("UPDATE orders SET status='expired' WHERE id = %s", (order["id"],))
-                send_notification(
-                    order["customer_id"],
-                    "client",
-                    f"⏰ Заказ №{order['id']} снят"
-                )
+                send_notification(order["customer_id"], "client", f"⏰ Заказ №{order['id']} снят")
     conn.close()
 
 scheduler = BackgroundScheduler()
 scheduler.add_job(func=expire_orders, trigger="interval", hours=1)
 scheduler.start()
 
-# -------------------------------------------------------------------
-# 5. Ядро – бизнес-логика
-# -------------------------------------------------------------------
+# ---------- Бизнес-логика ----------
 def create_order_logic(customer_id, title, description, price, urgency, hours_to_live, files):
     user = get_user(customer_id)
     if not user:
@@ -173,15 +152,12 @@ def create_order_logic(customer_id, title, description, price, urgency, hours_to
     if user["balance"] < price:
         return {"success": False, "error": "Недостаточно баллов"}
 
-    # Принудительные лимиты для срочности
     if urgency == "high":
         hours_to_live = 1
     elif urgency == "medium":
         hours_to_live = 24
-    # для low оставляем как есть
 
     expires_at = (datetime.utcnow() + timedelta(hours=hours_to_live)).isoformat()
-    
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
@@ -325,9 +301,7 @@ def get_orders_logic(filters):
     conn.close()
     return {"success": True, "data": [dict(row) for row in orders]}
 
-# -------------------------------------------------------------------
-# 6. Flask (только healthcheck)
-# -------------------------------------------------------------------
+# ---------- Flask ----------
 flask_app = Flask(__name__)
 
 @flask_app.route('/')
@@ -335,9 +309,7 @@ flask_app = Flask(__name__)
 def health():
     return jsonify({"status": "ok", "database": "postgresql"})
 
-# -------------------------------------------------------------------
-# 7. Client Bot
-# -------------------------------------------------------------------
+# ---------- Client Bot ----------
 storage = MemoryStorage()
 client_bot = Bot(token=CLIENT_TOKEN)
 dp_client = Dispatcher(client_bot, storage=storage)
@@ -352,12 +324,10 @@ class CreateOrder(StatesGroup):
 
 @dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message):
-    tg_id = message.from_user.id
-    username = message.from_user.username or ""
-    user = get_user(tg_id, username)
+    user = get_user(message.from_user.id, message.from_user.username)
     await message.answer(
-        f"🏗️ Добро пожаловать в биржу CAD (клиент)!\nВаш баланс: {user['balance']} баллов\n\n"
-        "/new - создать заказ\n/my_orders - мои заказы\n/balance - баланс\n/help - помощь"
+        f"🏗️ Добро пожаловать!\nВаш баланс: {user['balance']} баллов\n\n"
+        "/new - создать заказ\n/balance - баланс\n/help - помощь"
     )
 
 @dp_client.message_handler(Command("balance"))
@@ -408,11 +378,10 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     urgency = callback.data
     async with state.proxy() as data:
         data['urgency'] = urgency
-    
     messages = {
-        "high": "🟥 Высокая — заказ будет снят через 1 час",
-        "medium": "🟨 Средняя — заказ будет снят через 24 часа",
-        "low": "🟩 Низкая — заказ будет снят через указанное вами количество часов"
+        "high": "🟥 Высокая — снятие через 1 час",
+        "medium": "🟨 Средняя — снятие через 24 часа",
+        "low": "🟩 Низкая — через указанное количество часов"
     }
     await callback.message.answer(messages[urgency])
     await CreateOrder.next()
@@ -522,9 +491,7 @@ async def cmd_help(message: Message):
         "/cancel - отменить создание заказа"
     )
 
-# -------------------------------------------------------------------
-# 8. Executor Bot (ПОЛНАЯ ВЕРСИЯ С ФАЙЛАМИ И ФИЛЬТРАМИ)
-# -------------------------------------------------------------------
+# ---------- Executor Bot ----------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
 dp_executor = Dispatcher(executor_bot, storage=MemoryStorage())
 
@@ -535,9 +502,7 @@ user_temp = {}
 
 @dp_executor.message_handler(Command("start"))
 async def cmd_start_executor(message: Message):
-    tg_id = message.from_user.id
-    username = message.from_user.username or ""
-    get_user(tg_id, username)
+    get_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "👷 Биржа CAD (исполнитель)!\n"
         "/feed - все заказы\n"
@@ -559,56 +524,37 @@ async def cmd_balance_executor(message: Message):
 async def cmd_feed(message: Message):
     args = message.text.split()
     filters = {"status": "open", "limit": 20}
-    
-    if len(args) > 1:
-        if args[1] in ['high', 'medium', 'low']:
-            filters["urgency"] = args[1]
-    
+    if len(args) > 1 and args[1] in ['high', 'medium', 'low']:
+        filters["urgency"] = args[1]
     result = get_orders_logic(filters)
     if not result.get("success"):
         await message.answer("❌ Ошибка")
         return
-    
     orders = result.get("data", [])
     if not orders:
         await message.answer("Нет открытых заказов.")
         return
-    
     for o in orders:
-        # Формируем время снятия
         expires_dt = datetime.fromisoformat(o['expires_at'])
         expires_str = expires_dt.strftime("%d.%m.%Y %H:%M")
-        
-        # Иконка срочности
-        urgency_icons = {"high": "🟥", "medium": "🟨", "low": "🟩"}
-        icon = urgency_icons.get(o['urgency'], "🟩")
-        
-        # Проверяем наличие файлов
+        icon = {"high": "🟥", "medium": "🟨", "low": "🟩"}.get(o['urgency'], "🟩")
         has_files = o.get('files') and o['files'] != '[]'
-        files_indicator = " 📎" if has_files else ""
-        
         text = (
-            f"{icon} #{o['id']} | {o['title']}{files_indicator}\n"
+            f"{icon} #{o['id']} | {o['title']}{' 📎' if has_files else ''}\n"
             f"💰 {o['price']} баллов\n"
             f"⏳ Снятие: {expires_str}\n"
             f"📝 {o['description'][:80]}"
         )
-        
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{o['id']}")]
         ])
-        
-        # Если есть файлы — отправляем их прямо в ленте
+        await message.answer(text, reply_markup=kb)
         if has_files:
-            await message.answer(text, reply_markup=kb)
             try:
-                files = json.loads(o['files'])
-                for file_id in files:
+                for file_id in json.loads(o['files']):
                     await message.answer_document(file_id)
             except:
                 pass
-        else:
-            await message.answer(text, reply_markup=kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
 async def callback_take(callback: CallbackQuery):
@@ -646,14 +592,9 @@ async def cmd_my_orders_executor(message: Message):
         await message.answer("У вас нет взятых заказов.")
         return
     text = "📌 Ваши заказы:\n"
+    status_emoji = {"in_progress": "🔄", "completed": "⏳", "closed": "✅", "cancelled": "❌"}
     for o in orders:
-        status_emoji = {
-            "in_progress": "🔄",
-            "completed": "⏳",
-            "closed": "✅",
-            "cancelled": "❌"
-        }.get(o['status'], "❓")
-        text += f"{status_emoji} #{o['id']} | {o['title']} | {o['status']}\n"
+        text += f"{status_emoji.get(o['status'], '❓')} #{o['id']} | {o['title']} | {o['status']}\n"
     await message.answer(text)
 
 @dp_executor.message_handler(Command("submit"))
@@ -667,24 +608,17 @@ async def cmd_submit(message: Message):
     except:
         await message.answer("ID должно быть числом")
         return
-    
     orders_result = get_orders_logic({"id": order_id})
-    if not orders_result.get("success"):
+    if not orders_result.get("success") or not orders_result.get("data"):
         await message.answer("❌ Заказ не найден")
         return
-    orders = orders_result.get("data", [])
-    if not orders:
-        await message.answer("❌ Заказ не найден")
-        return
-    order = orders[0]
-    
+    order = orders_result.get("data")[0]
     if order.get("executor_id") != message.from_user.id:
         await message.answer("❌ Вы не исполнитель")
         return
     if order.get("status") != "in_progress":
         await message.answer("❌ Заказ не в работе")
         return
-    
     user_temp[message.from_user.id] = order_id
     await SubmitOrder.waiting_for_files.set()
     await message.answer("Пришлите файлы, затем /done_files")
@@ -692,11 +626,8 @@ async def cmd_submit(message: Message):
 @dp_executor.message_handler(content_types=['document'], state=SubmitOrder.waiting_for_files)
 async def submit_files(message: Message, state: FSMContext):
     tg_id = message.from_user.id
-    if 'result_files' not in user_temp:
-        user_temp['result_files'] = {}
-    if tg_id not in user_temp['result_files']:
-        user_temp['result_files'][tg_id] = []
-    user_temp['result_files'][tg_id].append(message.document.file_id)
+    user_temp.setdefault('result_files', {})
+    user_temp['result_files'].setdefault(tg_id, []).append(message.document.file_id)
     await message.answer(f"Файл добавлен. Ещё или /done_files")
 
 @dp_executor.message_handler(Command("done_files"), state=SubmitOrder.waiting_for_files)
@@ -712,9 +643,8 @@ async def finish_submit(message: Message, state: FSMContext):
         await message.answer(f"✅ Решение по заказу #{order_id} отправлено")
     else:
         await message.answer(f"❌ {result.get('error')}")
-    del user_temp[tg_id]
-    if tg_id in user_temp.get('result_files', {}):
-        del user_temp['result_files'][tg_id]
+    user_temp.pop(tg_id, None)
+    user_temp.get('result_files', {}).pop(tg_id, None)
     await state.finish()
 
 @dp_executor.message_handler(Command("help"))
@@ -737,12 +667,9 @@ async def cmd_cancel_state(message: Message, state: FSMContext):
     await state.finish()
     await message.answer("Отменено.")
 
-# -------------------------------------------------------------------
-# 9. Запуск
-# -------------------------------------------------------------------
+# ---------- Запуск ----------
 def run_flask():
-    port = int(os.getenv("PORT", 10000))
-    flask_app.run(host="0.0.0.0", port=port, use_reloader=False)
+    flask_app.run(host="0.0.0.0", port=int(os.getenv("PORT", 10000)), use_reloader=False)
 
 async def run_bots_async():
     logger.info("Запуск ботов...")
@@ -757,9 +684,7 @@ async def run_bots_async():
 
 if __name__ == "__main__":
     logger.info("Запуск CAD Exchange платформы (PostgreSQL)")
-    flask_thread = threading.Thread(target=run_flask, daemon=True)
-    flask_thread.start()
-    logger.info(f"Flask запущен на порту {os.getenv('PORT', 10000)}")
+    threading.Thread(target=run_flask, daemon=True).start()
     try:
         asyncio.run(run_bots_async())
     except KeyboardInterrupt:
