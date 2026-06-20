@@ -91,20 +91,26 @@ init_db()
 # -------------------------------------------------------------------
 def get_user(telegram_id, username=None):
     conn = get_db_connection()
-    with conn:
-        with conn.cursor() as c:
-            c.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-            user = c.fetchone()
-            if not user and username is not None:
-                c.execute(
-                    "INSERT INTO users (telegram_id, username) VALUES (%s, %s)",
-                    (telegram_id, username)
-                )
-                conn.commit()
-                c.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-                user = c.fetchone()
+    cursor = conn.cursor()
+    
+    # Проверяем, есть ли пользователь
+    cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+    user = cursor.fetchone()
+    
+    # Если нет — создаём
+    if not user and username is not None:
+        cursor.execute(
+            "INSERT INTO users (telegram_id, username) VALUES (%s, %s)",
+            (telegram_id, username)
+        )
+        conn.commit()  # ОБЯЗАТЕЛЬНО
+        # Повторно читаем
+        cursor.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+        user = cursor.fetchone()
+    
+    cursor.close()
     conn.close()
-    # Преобразуем RealDictRow в обычный dict, если это не None
+    
     return dict(user) if user else None
 
 def update_balance(telegram_id, delta):
