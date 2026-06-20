@@ -1,5 +1,4 @@
 import os
-import sqlite3
 import json
 import sys
 import asyncio
@@ -9,21 +8,19 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.filters import Command, StateFilter
+from aiogram.dispatcher.filters import Command
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
 from aiogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 import requests
+import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
-# Для совместимости с Windows
-if sys.version_info[0] == 3 and sys.version_info[1] >= 8 and sys.platform.startswith('win'):
-    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 load_dotenv()
 
@@ -32,110 +29,128 @@ load_dotenv()
 # -------------------------------------------------------------------
 CLIENT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
-DB_PATH = "cad_exchange.db"
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise RuntimeError("DATABASE_URL environment variable not set")
 
 # -------------------------------------------------------------------
-# 1. Flask приложение (только для healthcheck)
+# 1. Подключение к PostgreSQL
 # -------------------------------------------------------------------
-flask_app = Flask(__name__)
+def get_db_connection():
+    conn = psycopg2.connect(DATABASE_URL)
+    conn.row_factory = psycopg2.extras.RealDictCursor
+    return conn
 
-@flask_app.route('/')
-def home():
-    return "CAD Exchange API is running"
-
-@flask_app.route('/health')
-def health():
-    return jsonify({"status": "ok", "bots_running": True})
-
-# -------------------------------------------------------------------
-# 1.1 Инициализация базы данных
-# -------------------------------------------------------------------
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS users (
-            telegram_id INTEGER PRIMARY KEY,
-            username TEXT,
-            balance INTEGER DEFAULT 20,
-            rating REAL DEFAULT 0.0,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-    ''')
-    c.execute('''
-        CREATE TABLE IF NOT EXISTS orders (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            customer_id INTEGER NOT NULL,
-            executor_id INTEGER DEFAULT NULL,
-            title TEXT NOT NULL,
-            description TEXT,
-            files TEXT,
-            price INTEGER NOT NULL,
-            urgency TEXT CHECK(urgency IN ('low','medium','high')) DEFAULT 'medium',
-            days_to_live INTEGER NOT NULL,
-            status TEXT CHECK(status IN ('open','in_progress','completed','closed','expired','cancelled')) DEFAULT 'open',
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            expires_at TIMESTAMP,
-            taken_at TIMESTAMP,
-            completed_at TIMESTAMP,
-            result_files TEXT,
-            FOREIGN KEY (customer_id) REFERENCES users(telegram_id),
-            FOREIGN KEY (executor_id) REFERENCES users(telegram_id)
-        )
-    ''')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
-    c.execute('CREATE INDEX IF NOT EXISTS idx_orders_expires ON orders(expires_at)')
-    conn.commit()
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as c:
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS users (
+                    telegram_id BIGINT PRIMARY KEY,
+                    username TEXT,
+                    balance INTEGER DEFAULT 20,
+                    real_balance DECIMAL(10,2) DEFAULT 0.00,
+                    rating REAL DEFAULT 0.0,
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+                )
+            ''')
+            c.execute('''
+                CREATE TABLE IF NOT EXISTS orders (
+                    id SERIAL PRIMARY KEY,
+                    customer_id BIGINT NOT NULL,
+                    executor_id BIGINT DEFAULT NULL,
+                    title TEXT NOT NULL,
+                    description TEXT,
+                    files TEXT,
+                    price INTEGER NOT NULL,
+                    urgency TEXT CHECK(urgency IN ('low','medium','high')) DEFAULT 'medium',
+                    hours_to_live INTEGER NOT NULL,
+                    status TEXT CHECK(status IN ('open','in_progress','completed','closed','expired','cancelled')) DEFAULT 'open',
+                    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP WITH TIME ZONE,
+                    taken_at TIMESTAMP WITH TIME ZONE,
+                    completed_at TIMESTAMP WITH TIME ZONE,
+                    result_files TEXT,
+                    real_price DECIMAL(10,2) DEFAULT NULL,
+                    payment_method TEXT,
+                    payment_id TEXT,
+                    payment_status TEXT DEFAULT 'pending',
+                    FOREIGN KEY (customer_id) REFERENCES users(telegram_id),
+                    FOREIGN KEY (executor_id) REFERENCES users(telegram_id)
+                )
+            ''')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_expires ON orders(expires_at)')
     conn.close()
+    logger.info("Database initialized")
 
 init_db()
 
 # -------------------------------------------------------------------
-# 1.2 Вспомогательные функции для работы с БД
+# 2. Функции работы с БД
 # -------------------------------------------------------------------
-def get_db_connection():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
-    return conn
-
 def get_user(telegram_id, username=None):
     conn = get_db_connection()
-    user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
-    if not user and username is not None:
-        conn.execute("INSERT INTO users (telegram_id, username) VALUES (?, ?)", (telegram_id, username))
-        conn.commit()
-        user = conn.execute("SELECT * FROM users WHERE telegram_id = ?", (telegram_id,)).fetchone()
+    with conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+            user = c.fetchone()
+            if not user and username is not None:
+                c.execute(
+                    "INSERT INTO users (telegram_id, username) VALUES (%s, %s)",
+                    (telegram_id, username)
+                )
+                conn.commit()
+                c.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
+                user = c.fetchone()
     conn.close()
     return dict(user) if user else None
 
 def update_balance(telegram_id, delta):
     conn = get_db_connection()
-    conn.execute("UPDATE users SET balance = balance + ? WHERE telegram_id = ?", (delta, telegram_id))
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute(
+                "UPDATE users SET balance = balance + %s WHERE telegram_id = %s",
+                (delta, telegram_id)
+            )
     conn.close()
 
+# -------------------------------------------------------------------
+# 3. Отправка уведомлений
+# -------------------------------------------------------------------
 def send_notification(telegram_id, bot_type, text):
     token = CLIENT_TOKEN if bot_type == 'client' else EXECUTOR_TOKEN
     if not token:
-        print(f"Уведомление для {telegram_id}: {text}")
+        logger.info(f"Уведомление для {telegram_id}: {text}")
         return
     url = f"https://api.telegram.org/bot{token}/sendMessage"
     try:
         requests.post(url, json={"chat_id": telegram_id, "text": text}, timeout=5)
     except Exception as e:
-        print(f"Ошибка отправки: {e}")
+        logger.error(f"Ошибка отправки: {e}")
 
+# -------------------------------------------------------------------
+# 4. Планировщик
+# -------------------------------------------------------------------
 def expire_orders():
     conn = get_db_connection()
-    now = datetime.utcnow().isoformat()
-    expired = conn.execute(
-        "SELECT id, customer_id FROM orders WHERE status='open' AND expires_at < ?",
-        (now,)
-    ).fetchall()
-    for order in expired:
-        conn.execute("UPDATE orders SET status='expired' WHERE id=?", (order["id"],))
-        send_notification(order["customer_id"], "client", f"⏰ Заказ №{order['id']} снят")
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            now = datetime.utcnow().isoformat()
+            c.execute(
+                "SELECT id, customer_id FROM orders WHERE status='open' AND expires_at < %s",
+                (now,)
+            )
+            expired = c.fetchall()
+            for order in expired:
+                c.execute("UPDATE orders SET status='expired' WHERE id = %s", (order["id"],))
+                send_notification(
+                    order["customer_id"],
+                    "client",
+                    f"⏰ Заказ №{order['id']} снят"
+                )
     conn.close()
 
 scheduler = BackgroundScheduler()
@@ -143,98 +158,100 @@ scheduler.add_job(func=expire_orders, trigger="interval", hours=1)
 scheduler.start()
 
 # -------------------------------------------------------------------
-# 1.3 Логические функции ядра (без HTTP)
+# 5. Ядро – бизнес-логика
 # -------------------------------------------------------------------
-def create_order_logic(customer_id, title, description, price, urgency, days_to_live, files):
+def create_order_logic(customer_id, title, description, price, urgency, hours_to_live, files):
     user = get_user(customer_id)
     if not user:
         return {"success": False, "error": "Пользователь не найден"}
     if user["balance"] < price:
         return {"success": False, "error": "Недостаточно баллов"}
+
+    # Принудительные лимиты для срочности
+    if urgency == "high":
+        hours_to_live = 1
+    elif urgency == "medium":
+        hours_to_live = 24
+    # для low оставляем как есть
+
+    expires_at = (datetime.utcnow() + timedelta(hours=hours_to_live)).isoformat()
     
-    expires_at = (datetime.utcnow() + timedelta(days=days_to_live)).isoformat()
     conn = get_db_connection()
-    cursor = conn.execute(
-        '''INSERT INTO orders 
-           (customer_id, title, description, files, price, urgency, days_to_live, expires_at, status)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'open')''',
-        (customer_id, title, description, json.dumps(files), price, urgency, days_to_live, expires_at)
-    )
-    order_id = cursor.lastrowid
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute(
+                '''INSERT INTO orders 
+                   (customer_id, title, description, files, price, urgency, hours_to_live, expires_at, status)
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 'open')
+                   RETURNING id''',
+                (customer_id, title, description, json.dumps(files), price, urgency, hours_to_live, expires_at)
+            )
+            order_id = c.fetchone()["id"]
     conn.close()
     update_balance(customer_id, -price)
     return {"success": True, "order_id": order_id}
 
 def take_order_logic(order_id, executor_id):
     conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return {"success": False, "error": "Заказ не найден"}
-    if order["status"] != "open":
-        conn.close()
-        return {"success": False, "error": "Заказ уже не открыт"}
-    if order["customer_id"] == executor_id:
-        conn.close()
-        return {"success": False, "error": "Нельзя взять свой заказ"}
-    if datetime.utcnow().isoformat() > order["expires_at"]:
-        conn.execute("UPDATE orders SET status='expired' WHERE id=?", (order_id,))
-        conn.commit()
-        conn.close()
-        return {"success": False, "error": "Срок заказа истёк"}
-    
-    now = datetime.utcnow().isoformat()
-    conn.execute(
-        "UPDATE orders SET executor_id=?, status='in_progress', taken_at=? WHERE id=?",
-        (executor_id, now, order_id)
-    )
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            order = c.fetchone()
+            if not order:
+                return {"success": False, "error": "Заказ не найден"}
+            if order["status"] != "open":
+                return {"success": False, "error": "Заказ уже не открыт"}
+            if order["customer_id"] == executor_id:
+                return {"success": False, "error": "Нельзя взять свой заказ"}
+            if datetime.utcnow().isoformat() > order["expires_at"]:
+                c.execute("UPDATE orders SET status='expired' WHERE id = %s", (order_id,))
+                return {"success": False, "error": "Срок заказа истёк"}
+            now = datetime.utcnow().isoformat()
+            c.execute(
+                "UPDATE orders SET executor_id=%s, status='in_progress', taken_at=%s WHERE id=%s",
+                (executor_id, now, order_id)
+            )
     conn.close()
     send_notification(order["customer_id"], "client", f"🔧 Исполнитель взял заказ №{order_id}")
     return {"success": True}
 
 def submit_order_logic(order_id, executor_id, result_files):
     conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return {"success": False, "error": "Заказ не найден"}
-    if order["status"] != "in_progress":
-        conn.close()
-        return {"success": False, "error": "Заказ не в работе"}
-    if order["executor_id"] != executor_id:
-        conn.close()
-        return {"success": False, "error": "Вы не исполнитель"}
-    
-    now = datetime.utcnow().isoformat()
-    conn.execute(
-        "UPDATE orders SET status='completed', completed_at=?, result_files=? WHERE id=?",
-        (now, json.dumps(result_files), order_id)
-    )
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            order = c.fetchone()
+            if not order:
+                return {"success": False, "error": "Заказ не найден"}
+            if order["status"] != "in_progress":
+                return {"success": False, "error": "Заказ не в работе"}
+            if order["executor_id"] != executor_id:
+                return {"success": False, "error": "Вы не исполнитель"}
+            now = datetime.utcnow().isoformat()
+            c.execute(
+                "UPDATE orders SET status='completed', completed_at=%s, result_files=%s WHERE id=%s",
+                (now, json.dumps(result_files), order_id)
+            )
     conn.close()
     send_notification(order["customer_id"], "client", f"✅ Исполнитель сдал заказ №{order_id}. Примите /accept {order_id}")
     return {"success": True}
 
 def accept_order_logic(order_id, customer_id):
     conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return {"success": False, "error": "Заказ не найден"}
-    if order["status"] != "completed":
-        conn.close()
-        return {"success": False, "error": "Заказ не сдан"}
-    if order["customer_id"] != customer_id:
-        conn.close()
-        return {"success": False, "error": "Вы не заказчик"}
-    
-    executor_id = order["executor_id"]
-    reward = order["price"]
-    update_balance(executor_id, reward)
-    conn.execute("UPDATE orders SET status='closed' WHERE id=?", (order_id,))
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            order = c.fetchone()
+            if not order:
+                return {"success": False, "error": "Заказ не найден"}
+            if order["status"] != "completed":
+                return {"success": False, "error": "Заказ не сдан"}
+            if order["customer_id"] != customer_id:
+                return {"success": False, "error": "Вы не заказчик"}
+            executor_id = order["executor_id"]
+            reward = order["price"]
+            update_balance(executor_id, reward)
+            c.execute("UPDATE orders SET status='closed' WHERE id = %s", (order_id,))
     conn.close()
     send_notification(executor_id, "executor", f"🎉 Заказчик принял работу. Вам начислено {reward} баллов")
     send_notification(customer_id, "client", f"✅ Вы приняли работу по заказу №{order_id}")
@@ -242,23 +259,21 @@ def accept_order_logic(order_id, customer_id):
 
 def cancel_order_logic(order_id, user_id):
     conn = get_db_connection()
-    order = conn.execute("SELECT * FROM orders WHERE id = ?", (order_id,)).fetchone()
-    if not order:
-        conn.close()
-        return {"success": False, "error": "Заказ не найден"}
-    if order["customer_id"] != user_id:
-        conn.close()
-        return {"success": False, "error": "Только заказчик может отменить"}
-    if order["status"] not in ("open", "in_progress"):
-        conn.close()
-        return {"success": False, "error": "Невозможно отменить"}
-    
-    if order["status"] == "open":
-        update_balance(user_id, order["price"])
-    if order["status"] == "in_progress" and order["executor_id"]:
-        send_notification(order["executor_id"], "executor", f"⚠️ Заказчик отменил заказ №{order_id}")
-    conn.execute("UPDATE orders SET status='cancelled' WHERE id=?", (order_id,))
-    conn.commit()
+    with conn:
+        with conn.cursor() as c:
+            c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
+            order = c.fetchone()
+            if not order:
+                return {"success": False, "error": "Заказ не найден"}
+            if order["customer_id"] != user_id:
+                return {"success": False, "error": "Только заказчик может отменить"}
+            if order["status"] not in ("open", "in_progress"):
+                return {"success": False, "error": "Невозможно отменить"}
+            if order["status"] == "open":
+                update_balance(user_id, order["price"])
+            if order["status"] == "in_progress" and order["executor_id"]:
+                send_notification(order["executor_id"], "executor", f"⚠️ Заказчик отменил заказ №{order_id}")
+            c.execute("UPDATE orders SET status='cancelled' WHERE id = %s", (order_id,))
     conn.close()
     send_notification(user_id, "client", f"❌ Вы отменили заказ №{order_id}")
     return {"success": True}
@@ -276,34 +291,46 @@ def get_orders_logic(filters):
     query = "SELECT * FROM orders WHERE 1=1"
     params = []
     if status:
-        query += " AND status = ?"
+        query += " AND status = %s"
         params.append(status)
     if urgency:
-        query += " AND urgency = ?"
+        query += " AND urgency = %s"
         params.append(urgency)
     if price_min is not None:
-        query += " AND price >= ?"
+        query += " AND price >= %s"
         params.append(price_min)
     if price_max is not None:
-        query += " AND price <= ?"
+        query += " AND price <= %s"
         params.append(price_max)
     if customer_id is not None:
-        query += " AND customer_id = ?"
+        query += " AND customer_id = %s"
         params.append(customer_id)
     if executor_id is not None:
-        query += " AND executor_id = ?"
+        query += " AND executor_id = %s"
         params.append(executor_id)
-    query += " ORDER BY created_at DESC LIMIT ? OFFSET ?"
+    query += " ORDER BY created_at DESC LIMIT %s OFFSET %s"
     params.extend([limit, offset])
 
     conn = get_db_connection()
-    rows = conn.execute(query, params).fetchall()
-    orders = [dict(row) for row in rows]
+    with conn:
+        with conn.cursor() as c:
+            c.execute(query, params)
+            orders = c.fetchall()
     conn.close()
-    return {"success": True, "data": orders}
+    return {"success": True, "data": [dict(row) for row in orders]}
 
 # -------------------------------------------------------------------
-# 2. Client Bot
+# 6. Flask (только healthcheck)
+# -------------------------------------------------------------------
+flask_app = Flask(__name__)
+
+@flask_app.route('/')
+@flask_app.route('/health')
+def health():
+    return jsonify({"status": "ok", "database": "postgresql"})
+
+# -------------------------------------------------------------------
+# 7. Client Bot
 # -------------------------------------------------------------------
 storage = MemoryStorage()
 client_bot = Bot(token=CLIENT_TOKEN)
@@ -314,15 +341,14 @@ class CreateOrder(StatesGroup):
     description = State()
     price = State()
     urgency = State()
-    days = State()
-    files = State()  # теперь храним список файлов прямо в state
+    hours = State()
+    files = State()
 
 @dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message):
     tg_id = message.from_user.id
     username = message.from_user.username or ""
-    get_user(tg_id, username)
-    user = get_user(tg_id)
+    user = get_user(tg_id, username)
     await message.answer(
         f"🏗️ Добро пожаловать в биржу CAD (клиент)!\nВаш баланс: {user['balance']} баллов\n\n"
         "/new - создать заказ\n/my_orders - мои заказы\n/balance - баланс\n/help - помощь"
@@ -342,7 +368,7 @@ async def cmd_new(message: Message):
 async def process_title(message: Message, state: FSMContext):
     async with state.proxy() as data:
         data['title'] = message.text
-        data['files'] = []  # инициализируем список файлов
+        data['files'] = []
     await CreateOrder.next()
     await message.answer("Введите описание:")
 
@@ -362,9 +388,9 @@ async def process_price(message: Message, state: FSMContext):
         async with state.proxy() as data:
             data['price'] = price
         kb = InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="Низкая", callback_data="low"),
-             InlineKeyboardButton(text="Средняя", callback_data="medium"),
-             InlineKeyboardButton(text="Высокая", callback_data="high")]
+            [InlineKeyboardButton(text="🟥 Высокая (1 час)", callback_data="high"),
+             InlineKeyboardButton(text="🟨 Средняя (24 часа)", callback_data="medium"),
+             InlineKeyboardButton(text="🟩 Низкая (сколько укажу)", callback_data="low")]
         ])
         await CreateOrder.next()
         await message.answer("Выберите срочность:", reply_markup=kb)
@@ -373,66 +399,57 @@ async def process_price(message: Message, state: FSMContext):
 
 @dp_client.callback_query_handler(lambda c: c.data in ['low', 'medium', 'high'], state=CreateOrder.urgency)
 async def process_urgency(callback: CallbackQuery, state: FSMContext):
+    urgency = callback.data
     async with state.proxy() as data:
-        data['urgency'] = callback.data
+        data['urgency'] = urgency
+    
+    messages = {
+        "high": "🟥 Высокая — заказ будет снят через 1 час",
+        "medium": "🟨 Средняя — заказ будет снят через 24 часа",
+        "low": "🟩 Низкая — заказ будет снят через указанное вами количество часов"
+    }
+    await callback.message.answer(messages[urgency])
     await CreateOrder.next()
-    await callback.message.answer("Через сколько дней снять заказ? (введите число дней)")
+    await callback.message.answer("⏰ Через сколько часов снять заказ? (введите число)")
     await callback.answer()
 
-@dp_client.message_handler(state=CreateOrder.days)
-async def process_days(message: Message, state: FSMContext):
+@dp_client.message_handler(state=CreateOrder.hours)
+async def process_hours(message: Message, state: FSMContext):
     try:
-        days = int(message.text)
-        if days < 1:
+        hours = int(message.text)
+        if hours < 1:
             raise ValueError
         async with state.proxy() as data:
-            data['days'] = days
+            data['hours'] = hours
         await CreateOrder.next()
         await message.answer("📎 Присылайте файлы. Когда закончите, введите /done")
     except:
         await message.answer("❌ Введите число больше 0")
 
-# Обработчик файлов — сохраняем file_id в state
 @dp_client.message_handler(content_types=['document'], state=CreateOrder.files)
 async def process_files(message: Message, state: FSMContext):
     async with state.proxy() as data:
-        if 'files' not in data:
-            data['files'] = []
         data['files'].append(message.document.file_id)
     await message.answer(f"✅ Файл {message.document.file_name} добавлен. Ещё или /done")
 
-# Команда /done — завершаем создание заказа
 @dp_client.message_handler(Command("done"), state=CreateOrder.files)
 async def finish_files(message: Message, state: FSMContext):
     data = await state.get_data()
-    files = data.get('files', [])
-    
-    # Проверяем обязательные поля
-    required_fields = ['title', 'description', 'price', 'urgency', 'days']
-    for field in required_fields:
-        if field not in data:
-            await message.answer(f"❌ Ошибка: не заполнено поле {field}. Попробуйте /new заново")
-            await state.finish()
-            return
-    
     result = create_order_logic(
         message.from_user.id,
         data['title'],
         data['description'],
         data['price'],
         data['urgency'],
-        data['days'],
-        files
+        data['hours'],
+        data.get('files', [])
     )
-    
     if result.get("success"):
         await message.answer(f"✅ Заказ №{result['order_id']} создан! Списано {data['price']} баллов.")
     else:
         await message.answer(f"❌ Ошибка: {result.get('error')}")
-    
     await state.finish()
 
-# Отмена создания заказа
 @dp_client.message_handler(Command("cancel"), state='*')
 async def cancel_cmd(message: Message, state: FSMContext):
     await state.finish()
@@ -500,7 +517,7 @@ async def cmd_help(message: Message):
     )
 
 # -------------------------------------------------------------------
-# 3. Executor Bot
+# 8. Executor Bot (ПОЛНАЯ ВЕРСИЯ С ФАЙЛАМИ И ФИЛЬТРАМИ)
 # -------------------------------------------------------------------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
 dp_executor = Dispatcher(executor_bot, storage=MemoryStorage())
@@ -517,7 +534,14 @@ async def cmd_start_executor(message: Message):
     get_user(tg_id, username)
     await message.answer(
         "👷 Биржа CAD (исполнитель)!\n"
-        "/feed - заказы\n/take <id> - взять\n/my - мои заказы\n/submit <id> - сдать\n/balance - баланс"
+        "/feed - все заказы\n"
+        "/feed high - только срочные (1 час)\n"
+        "/feed medium - средние (24 часа)\n"
+        "/feed low - низкие\n"
+        "/take <id> - взять\n"
+        "/my - мои заказы\n"
+        "/submit <id> - сдать\n"
+        "/balance - баланс"
     )
 
 @dp_executor.message_handler(Command("balance"))
@@ -527,20 +551,58 @@ async def cmd_balance_executor(message: Message):
 
 @dp_executor.message_handler(Command("feed"))
 async def cmd_feed(message: Message):
-    result = get_orders_logic({"status": "open", "limit": 10})
+    args = message.text.split()
+    filters = {"status": "open", "limit": 20}
+    
+    if len(args) > 1:
+        if args[1] in ['high', 'medium', 'low']:
+            filters["urgency"] = args[1]
+    
+    result = get_orders_logic(filters)
     if not result.get("success"):
         await message.answer("❌ Ошибка")
         return
+    
     orders = result.get("data", [])
     if not orders:
         await message.answer("Нет открытых заказов.")
         return
+    
     for o in orders:
+        # Формируем время снятия
+        expires_dt = datetime.fromisoformat(o['expires_at'])
+        expires_str = expires_dt.strftime("%d.%m.%Y %H:%M")
+        
+        # Иконка срочности
+        urgency_icons = {"high": "🟥", "medium": "🟨", "low": "🟩"}
+        icon = urgency_icons.get(o['urgency'], "🟩")
+        
+        # Проверяем наличие файлов
+        has_files = o.get('files') and o['files'] != '[]'
+        files_indicator = " 📎" if has_files else ""
+        
+        text = (
+            f"{icon} #{o['id']} | {o['title']}{files_indicator}\n"
+            f"💰 {o['price']} баллов\n"
+            f"⏳ Снятие: {expires_str}\n"
+            f"📝 {o['description'][:80]}"
+        )
+        
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="✅ Взять", callback_data=f"take_{o['id']}")]
         ])
-        text = f"🔹 #{o['id']} | {o['title']}\n💰 {o['price']} баллов\n🔥 {o['urgency']}\n📅 до {o['expires_at'][:10]}"
-        await message.answer(text, reply_markup=kb)
+        
+        # Если есть файлы — отправляем их прямо в ленте
+        if has_files:
+            await message.answer(text, reply_markup=kb)
+            try:
+                files = json.loads(o['files'])
+                for file_id in files:
+                    await message.answer_document(file_id)
+            except:
+                pass
+        else:
+            await message.answer(text, reply_markup=kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
 async def callback_take(callback: CallbackQuery):
@@ -579,7 +641,13 @@ async def cmd_my_orders_executor(message: Message):
         return
     text = "📌 Ваши заказы:\n"
     for o in orders:
-        text += f"#{o['id']} | {o['title']} | {o['status']}\n"
+        status_emoji = {
+            "in_progress": "🔄",
+            "completed": "⏳",
+            "closed": "✅",
+            "cancelled": "❌"
+        }.get(o['status'], "❓")
+        text += f"{status_emoji} #{o['id']} | {o['title']} | {o['status']}\n"
     await message.answer(text)
 
 @dp_executor.message_handler(Command("submit"))
@@ -594,12 +662,16 @@ async def cmd_submit(message: Message):
         await message.answer("ID должно быть числом")
         return
     
-    # Проверяем, что заказ принадлежит исполнителю и в работе
     orders_result = get_orders_logic({"id": order_id})
     if not orders_result.get("success"):
         await message.answer("❌ Заказ не найден")
         return
-    order = orders_result["data"][0]
+    orders = orders_result.get("data", [])
+    if not orders:
+        await message.answer("❌ Заказ не найден")
+        return
+    order = orders[0]
+    
     if order.get("executor_id") != message.from_user.id:
         await message.answer("❌ Вы не исполнитель")
         return
@@ -639,8 +711,28 @@ async def finish_submit(message: Message, state: FSMContext):
         del user_temp['result_files'][tg_id]
     await state.finish()
 
+@dp_executor.message_handler(Command("help"))
+async def cmd_help_executor(message: Message):
+    await message.answer(
+        "Команды исполнителя:\n"
+        "/feed - все открытые заказы\n"
+        "/feed high - только срочные (1 час)\n"
+        "/feed medium - средние (24 часа)\n"
+        "/feed low - низкие\n"
+        "/take <id> - взять заказ\n"
+        "/my - мои заказы\n"
+        "/submit <id> - сдать решение\n"
+        "/balance - баланс\n"
+        "/cancel - отменить текущую операцию"
+    )
+
+@dp_executor.message_handler(Command("cancel"), state='*')
+async def cmd_cancel_state(message: Message, state: FSMContext):
+    await state.finish()
+    await message.answer("Отменено.")
+
 # -------------------------------------------------------------------
-# 4. Запуск всех компонентов
+# 9. Запуск
 # -------------------------------------------------------------------
 def run_flask():
     port = int(os.getenv("PORT", 10000))
@@ -658,7 +750,7 @@ async def run_bots_async():
     )
 
 if __name__ == "__main__":
-    logger.info("Запуск CAD Exchange платформы")
+    logger.info("Запуск CAD Exchange платформы (PostgreSQL)")
     flask_thread = threading.Thread(target=run_flask, daemon=True)
     flask_thread.start()
     logger.info(f"Flask запущен на порту {os.getenv('PORT', 10000)}")
@@ -667,5 +759,5 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         logger.info("Остановка...")
     except Exception as e:
-        logger.error(f"Ошибка: {e}")
+        logger.error(f"Критическая ошибка: {e}")
         sys.exit(1)
