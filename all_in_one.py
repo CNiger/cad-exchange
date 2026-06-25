@@ -18,12 +18,11 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
+# ---------- Настройки ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-
 load_dotenv()
 
-# ---------- Конфиги ----------
 CLIENT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -36,9 +35,10 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
+    
     with conn:
         with conn.cursor() as c:
-            # Таблица users (добавлены все поля для рейтинга)
+            # Таблица users
             c.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id BIGINT PRIMARY KEY,
@@ -46,20 +46,10 @@ def init_db():
                     balance INTEGER DEFAULT 20,
                     real_balance DECIMAL(10,2) DEFAULT 0.00,
                     rating REAL DEFAULT 0.0,
-                    completed_orders INTEGER DEFAULT 0,
-                    cancelled_orders INTEGER DEFAULT 0,
-                    expired_orders INTEGER DEFAULT 0,
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Добавляем колонки, если их нет (для старых БД)
-            for col in ['completed_orders', 'cancelled_orders', 'expired_orders']:
-                try:
-                    c.execute(f'ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0')
-                except:
-                    pass
-            
-            # Таблица заказов (с поддержкой critical)
+            # Таблица orders
             c.execute('''
                 CREATE TABLE IF NOT EXISTS orders (
                     id SERIAL PRIMARY KEY,
@@ -85,14 +75,7 @@ def init_db():
                     FOREIGN KEY (executor_id) REFERENCES users(telegram_id)
                 )
             ''')
-            # Обновляем CHECK constraint для urgency (добавляем critical)
-            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_urgency_check')
-            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_urgency_check CHECK (urgency IN (\'low\', \'medium\', \'high\', \'critical\'))')
-            # Добавляем статусы, если их нет
-            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check')
-            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_status_check CHECK (status IN (\'open\', \'in_progress\', \'completed\', \'closed\', \'expired\', \'cancelled\'))')
-            
-            # Таблица reviews (для оценок)
+            # Таблица reviews
             c.execute('''
                 CREATE TABLE IF NOT EXISTS reviews (
                     id SERIAL PRIMARY KEY,
@@ -103,13 +86,60 @@ def init_db():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Индексы
+            # Индексы для скорости
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_expires ON orders(expires_at)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_urgency ON orders(urgency)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_customer_id ON orders(customer_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_executor_id ON orders(executor_id)')
+            c.execute('CREATE INDEX IF NOT EXISTS idx_orders_reviews_executor ON reviews(executor_id)')
             conn.commit()
+    
+    # Добавляем колонки для рейтинга, если их нет
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as c:
+            # Проверяем и добавляем колонки в users
+            c.execute('''
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name='users' AND column_name='completed_orders'
+            ''')
+            if not c.fetchone():
+                c.execute('ALTER TABLE users ADD COLUMN completed_orders INTEGER DEFAULT 0')
+            
+            c.execute('''
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name='users' AND column_name='cancelled_orders'
+            ''')
+            if not c.fetchone():
+                c.execute('ALTER TABLE users ADD COLUMN cancelled_orders INTEGER DEFAULT 0')
+            
+            c.execute('''
+                SELECT column_name FROM information_schema.columns 
+                WHERE table_name='users' AND column_name='expired_orders'
+            ''')
+            if not c.fetchone():
+                c.execute('ALTER TABLE users ADD COLUMN expired_orders INTEGER DEFAULT 0')
+            conn.commit()
+    
+    # Обновляем CHECK для urgency (добавляем critical)
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as c:
+            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_urgency_check')
+            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_urgency_check CHECK (urgency IN (\'low\', \'medium\', \'high\', \'critical\'))')
+            conn.commit()
+    
+    # Обновляем CHECK для status
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as c:
+            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check')
+            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_status_check CHECK (status IN (\'open\', \'in_progress\', \'completed\', \'closed\', \'expired\', \'cancelled\'))')
+            conn.commit()
+    
     conn.close()
-    logger.info("Database initialized (critical + reviews + rating)")
+    logger.info("Database initialized successfully")
 
 init_db()
 
@@ -134,6 +164,7 @@ def get_user(telegram_id, username=None):
     return dict(user) if user else None
 
 def update_balance(telegram_id, delta):
+    """Атомарное обновление баланса"""
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
@@ -145,6 +176,10 @@ def update_balance(telegram_id, delta):
 
 def update_user_stats(telegram_id, field, delta=1):
     """Обновляет счётчики completed_orders, cancelled_orders, expired_orders"""
+    allowed_fields = {'completed_orders', 'cancelled_orders', 'expired_orders'}
+    if field not in allowed_fields:
+        raise ValueError(f"Invalid field: {field}")
+    
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
@@ -172,7 +207,7 @@ def send_notification(telegram_id, bot_type, text, reply_markup=None):
     except Exception as e:
         logger.error(f"Ошибка отправки: {e}")
 
-# ---------- Планировщик (каждые 5 минут) ----------
+# ---------- Планировщик ----------
 def expire_orders():
     conn = get_db_connection()
     with conn:
@@ -193,7 +228,7 @@ scheduler = BackgroundScheduler()
 scheduler.add_job(func=expire_orders, trigger="interval", minutes=5)
 scheduler.start()
 
-# ---------- Бизнес-логика ----------
+# ---------- Бизнес-логика (с защитой) ----------
 def create_order_logic(customer_id, title, description, price, urgency, hours_to_live, files):
     user = get_user(customer_id)
     if not user:
@@ -201,14 +236,29 @@ def create_order_logic(customer_id, title, description, price, urgency, hours_to
     if user["balance"] < price:
         return {"success": False, "error": "Недостаточно баллов"}
 
-    # Critical: принудительно 30 минут
+    # Ограничение: не более 5 открытых заказов
+    conn = get_db_connection()
+    with conn:
+        with conn.cursor() as c:
+            c.execute(
+                "SELECT COUNT(*) FROM orders WHERE customer_id = %s AND status = 'open'",
+                (customer_id,)
+            )
+            count = c.fetchone()['count']
+            if count >= 5:
+                conn.close()
+                return {"success": False, "error": "У вас уже 5 открытых заказов. Дождитесь их выполнения или отмените."}
+    conn.close()
+
     if urgency == "critical":
         hours_to_live = 0.5
 
     expires_at = (datetime.utcnow() + timedelta(hours=hours_to_live)).isoformat()
+    
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
+            # Создаём заказ и списываем баллы в одной транзакции
             c.execute(
                 '''INSERT INTO orders 
                    (customer_id, title, description, files, price, urgency, hours_to_live, expires_at, status)
@@ -217,25 +267,43 @@ def create_order_logic(customer_id, title, description, price, urgency, hours_to
                 (customer_id, title, description, json.dumps(files), price, urgency, hours_to_live, expires_at)
             )
             order_id = c.fetchone()["id"]
+            # Списываем баллы
+            c.execute(
+                "UPDATE users SET balance = balance - %s WHERE telegram_id = %s",
+                (price, customer_id)
+            )
     conn.close()
-    update_balance(customer_id, -price)
     return {"success": True, "order_id": order_id}
 
 def take_order_logic(order_id, executor_id):
+    # Проверка лимита взятых заказов (не более 3)
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
+            c.execute(
+                "SELECT COUNT(*) FROM orders WHERE executor_id = %s AND status = 'in_progress'",
+                (executor_id,)
+            )
+            count = c.fetchone()['count']
+            if count >= 3:
+                conn.close()
+                return {"success": False, "error": "У вас уже 3 заказа в работе. Завершите их, чтобы взять новый."}
+            
             c.execute("SELECT * FROM orders WHERE id = %s", (order_id,))
             order = c.fetchone()
             if not order:
+                conn.close()
                 return {"success": False, "error": "Заказ не найден"}
             if order["status"] != "open":
+                conn.close()
                 return {"success": False, "error": "Заказ уже не открыт"}
             if order["customer_id"] == executor_id:
+                conn.close()
                 return {"success": False, "error": "Нельзя взять свой заказ"}
             if datetime.utcnow().isoformat() > order["expires_at"]:
                 c.execute("UPDATE orders SET status='expired' WHERE id = %s", (order_id,))
                 update_user_stats(order["customer_id"], "expired_orders")
+                conn.close()
                 return {"success": False, "error": "Срок заказа истёк"}
             now = datetime.utcnow().isoformat()
             c.execute(
@@ -281,18 +349,20 @@ def accept_order_logic(order_id, customer_id):
                 return {"success": False, "error": "Вы не заказчик"}
             executor_id = order["executor_id"]
             reward = order["price"]
-            update_balance(executor_id, reward)
+            # Начисляем баллы и закрываем заказ в одной транзакции
+            c.execute(
+                "UPDATE users SET balance = balance + %s WHERE telegram_id = %s",
+                (reward, executor_id)
+            )
             update_user_stats(executor_id, "completed_orders")
             c.execute("UPDATE orders SET status='closed' WHERE id = %s", (order_id,))
     conn.close()
     send_notification(executor_id, "executor", f"🎉 Заказчик принял работу. Вам начислено {reward} баллов")
     send_notification(customer_id, "client", f"✅ Вы приняли работу по заказу №{order_id}")
-    # Запрос оценки
     ask_for_review(customer_id, executor_id, order_id)
     return {"success": True}
 
 def ask_for_review(customer_id, executor_id, order_id):
-    """Отправляет запрос на оценку исполнителя"""
     kb = InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="⭐ 1", callback_data=f"rate_{order_id}_1"),
          InlineKeyboardButton(text="⭐ 2", callback_data=f"rate_{order_id}_2"),
@@ -308,7 +378,6 @@ def ask_for_review(customer_id, executor_id, order_id):
     )
 
 def rate_executor_logic(order_id, customer_id, score):
-    """Сохраняет оценку в таблицу reviews и обновляет рейтинг исполнителя"""
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
@@ -318,6 +387,13 @@ def rate_executor_logic(order_id, customer_id, score):
                 conn.close()
                 return {"success": False, "error": "Заказ не найден"}
             executor_id = order["executor_id"]
+            
+            # Проверяем, не ставил ли уже оценку
+            c.execute("SELECT id FROM reviews WHERE order_id = %s AND customer_id = %s", (order_id, customer_id))
+            if c.fetchone():
+                conn.close()
+                return {"success": False, "error": "Вы уже оценили этот заказ"}
+            
             c.execute(
                 "INSERT INTO reviews (order_id, executor_id, customer_id, score) VALUES (%s, %s, %s, %s)",
                 (order_id, executor_id, customer_id, score)
@@ -420,7 +496,7 @@ class CreateOrder(StatesGroup):
 
 @dp_client.message_handler(Command("start"))
 async def cmd_start(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     user = get_user(message.from_user.id, message.from_user.username)
     await message.answer(
         f"🏗️ Добро пожаловать!\nВаш баланс: {user['balance']} баллов\n\n"
@@ -429,13 +505,13 @@ async def cmd_start(message: Message, state: FSMContext):
 
 @dp_client.message_handler(Command("balance"))
 async def cmd_balance(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     user = get_user(message.from_user.id)
     await message.answer(f"💰 Баланс: {user['balance']} баллов\n⭐ Рейтинг: {user['rating']}")
 
 @dp_client.message_handler(Command("profile"))
 async def cmd_profile(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     user = get_user(message.from_user.id)
     await message.answer(
         f"👤 Ваш профиль:\n"
@@ -448,7 +524,7 @@ async def cmd_profile(message: Message, state: FSMContext):
 
 @dp_client.message_handler(Command("my_orders"))
 async def cmd_my_orders(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     result = get_orders_logic({"customer_id": message.from_user.id})
     if not result.get("success"):
         await message.answer("❌ Ошибка")
@@ -464,7 +540,7 @@ async def cmd_my_orders(message: Message, state: FSMContext):
 
 @dp_client.message_handler(Command("accept"))
 async def cmd_accept(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /accept <ID>")
@@ -482,7 +558,7 @@ async def cmd_accept(message: Message, state: FSMContext):
 
 @dp_client.message_handler(Command("cancel_order"))
 async def cmd_cancel_order(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /cancel_order <ID>")
@@ -500,7 +576,7 @@ async def cmd_cancel_order(message: Message, state: FSMContext):
 
 @dp_client.message_handler(Command("help"))
 async def cmd_help(message: Message, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     await message.answer(
         "Команды заказчика:\n"
         "/new - создать заказ\n"
@@ -512,17 +588,14 @@ async def cmd_help(message: Message, state: FSMContext):
         "/cancel - отменить создание заказа"
     )
 
-# Команда /cancel принудительно сбрасывает состояние
 @dp_client.message_handler(Command("cancel"), state='*')
 async def cancel_cmd(message: Message, state: FSMContext):
     await state.finish()
     await message.answer("✅ Создание заказа отменено.")
 
-# --- Обработчики создания заказа (без изменений) ---
 @dp_client.message_handler(Command("new"))
 async def cmd_new(message: Message, state: FSMContext):
-    # Не сбрасываем, а перезапускаем создание
-    await state.finish()  # Сначала сбрасываем старое состояние
+    await state.finish()
     await CreateOrder.title.set()
     await message.answer("Введите заголовок задачи:")
 
@@ -619,10 +692,9 @@ async def finish_files(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {result.get('error')}")
     await state.finish()
 
-# Обработчик оценки
 @dp_client.callback_query_handler(lambda c: c.data.startswith("rate_"))
 async def rate_callback(callback: CallbackQuery, state: FSMContext):
-    await state.finish()  # Сброс состояния
+    await state.finish()
     parts = callback.data.split("_")
     order_id = int(parts[1])
     score = int(parts[2])
@@ -632,8 +704,6 @@ async def rate_callback(callback: CallbackQuery, state: FSMContext):
     else:
         await callback.message.answer(f"❌ Ошибка: {result.get('error')}")
     await callback.answer()
-
-
 
 # ---------- Executor Bot ----------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
@@ -646,7 +716,6 @@ user_temp = {}
 user_filters = {}
 
 def get_filter_keyboard(current_filters=None):
-    """Генерирует клавиатуру фильтров"""
     if current_filters is None:
         current_filters = {}
     urgency = current_filters.get("urgency", "all")
@@ -674,7 +743,8 @@ def get_filter_keyboard(current_filters=None):
     return kb
 
 @dp_executor.message_handler(Command("start"))
-async def cmd_start_executor(message: Message):
+async def cmd_start_executor(message: Message, state: FSMContext):
+    await state.finish()
     get_user(message.from_user.id, message.from_user.username)
     await message.answer(
         "👷 Биржа CAD (исполнитель)!\n"
@@ -689,12 +759,14 @@ async def cmd_start_executor(message: Message):
     )
 
 @dp_executor.message_handler(Command("balance"))
-async def cmd_balance_executor(message: Message):
+async def cmd_balance_executor(message: Message, state: FSMContext):
+    await state.finish()
     user = get_user(message.from_user.id)
     await message.answer(f"💰 Баланс: {user.get('balance', 0)} баллов\n⭐ Рейтинг: {user.get('rating', 0)}")
 
 @dp_executor.message_handler(Command("profile"))
-async def cmd_profile_executor(message: Message):
+async def cmd_profile_executor(message: Message, state: FSMContext):
+    await state.finish()
     user = get_user(message.from_user.id)
     await message.answer(
         f"👤 Ваш профиль исполнителя:\n"
@@ -706,14 +778,16 @@ async def cmd_profile_executor(message: Message):
     )
 
 @dp_executor.message_handler(Command("filters"))
-async def cmd_filters(message: Message):
+async def cmd_filters(message: Message, state: FSMContext):
+    await state.finish()
     tg_id = message.from_user.id
     current = user_filters.get(tg_id, {})
     kb = get_filter_keyboard(current)
     await message.answer("🔍 Выберите фильтры:", reply_markup=kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("filter_"))
-async def filter_callback(callback: CallbackQuery):
+async def filter_callback(callback: CallbackQuery, state: FSMContext):
+    await state.finish()
     tg_id = callback.from_user.id
     action = callback.data.replace("filter_", "")
     
@@ -749,7 +823,6 @@ async def filter_callback(callback: CallbackQuery):
     await callback.answer()
 
 async def show_feed(message, tg_id, offset=0):
-    """Показывает ленту с учётом фильтров и пагинации"""
     filters = user_filters.get(tg_id, {})
     
     db_filters = {"status": "open", "limit": 5, "offset": offset}
@@ -782,7 +855,6 @@ async def show_feed(message, tg_id, offset=0):
         return
     
     for o in orders:
-        # Защита от None в expires_at
         if o.get('expires_at'):
             try:
                 expires_dt = datetime.fromisoformat(o['expires_at'])
@@ -829,7 +901,8 @@ async def show_feed(message, tg_id, offset=0):
     await message.answer("📋 Навигация:", reply_markup=nav_kb)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("page_") and c.data != "page_info")
-async def page_callback(callback: CallbackQuery):
+async def page_callback(callback: CallbackQuery, state: FSMContext):
+    await state.finish()
     offset = int(callback.data.split("_")[1])
     if offset < 0:
         offset = 0
@@ -837,7 +910,8 @@ async def page_callback(callback: CallbackQuery):
     await callback.answer()
 
 @dp_executor.callback_query_handler(lambda c: c.data == "show_filters")
-async def show_filters_callback(callback: CallbackQuery):
+async def show_filters_callback(callback: CallbackQuery, state: FSMContext):
+    await state.finish()
     tg_id = callback.from_user.id
     current = user_filters.get(tg_id, {})
     kb = get_filter_keyboard(current)
@@ -845,11 +919,13 @@ async def show_filters_callback(callback: CallbackQuery):
     await callback.answer()
 
 @dp_executor.message_handler(Command("feed"))
-async def cmd_feed(message: Message):
+async def cmd_feed(message: Message, state: FSMContext):
+    await state.finish()
     await show_feed(message, message.from_user.id, 0)
 
 @dp_executor.callback_query_handler(lambda c: c.data.startswith("take_"))
-async def callback_take(callback: CallbackQuery):
+async def callback_take(callback: CallbackQuery, state: FSMContext):
+    await state.finish()
     order_id = int(callback.data.split("_")[1])
     result = take_order_logic(order_id, callback.from_user.id)
     if result.get("success"):
@@ -860,7 +936,8 @@ async def callback_take(callback: CallbackQuery):
     await callback.answer()
 
 @dp_executor.message_handler(Command("take"))
-async def cmd_take(message: Message):
+async def cmd_take(message: Message, state: FSMContext):
+    await state.finish()
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /take <id>")
@@ -877,7 +954,8 @@ async def cmd_take(message: Message):
         await message.answer(f"❌ {result.get('error')}")
 
 @dp_executor.message_handler(Command("my"))
-async def cmd_my_orders_executor(message: Message):
+async def cmd_my_orders_executor(message: Message, state: FSMContext):
+    await state.finish()
     result = get_orders_logic({"executor_id": message.from_user.id})
     orders = result.get("data", [])
     if not orders:
@@ -890,7 +968,8 @@ async def cmd_my_orders_executor(message: Message):
     await message.answer(text)
 
 @dp_executor.message_handler(Command("submit"))
-async def cmd_submit(message: Message):
+async def cmd_submit(message: Message, state: FSMContext):
+    await state.finish()
     args = message.text.split()
     if len(args) != 2:
         await message.answer("Использование: /submit <id>")
@@ -940,7 +1019,8 @@ async def finish_submit(message: Message, state: FSMContext):
     await state.finish()
 
 @dp_executor.message_handler(Command("help"))
-async def cmd_help_executor(message: Message):
+async def cmd_help_executor(message: Message, state: FSMContext):
+    await state.finish()
     await message.answer(
         "👷 Команды исполнителя:\n"
         "/feed - лента заказов\n"
@@ -974,7 +1054,7 @@ async def run_bots_async():
     )
 
 if __name__ == "__main__":
-    logger.info("🚀 Запуск CAD Exchange (critical + filters + rating)")
+    logger.info("🚀 Запуск CAD Exchange (critical + filters + rating + security)")
     threading.Thread(target=run_flask, daemon=True).start()
     try:
         asyncio.run(run_bots_async())
