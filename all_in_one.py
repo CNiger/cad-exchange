@@ -8,7 +8,7 @@ from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 from apscheduler.schedulers.background import BackgroundScheduler
 from aiogram import Bot, Dispatcher, types
-from aiogram.dispatcher.filters import Command, Text
+from aiogram.dispatcher.filters import Command
 from aiogram.contrib.fsm_storage.memory import MemoryStorage
 from aiogram.dispatcher import FSMContext
 from aiogram.dispatcher.filters.state import State, StatesGroup
@@ -18,11 +18,12 @@ import psycopg2
 import psycopg2.extras
 from dotenv import load_dotenv
 
-# ---------- Настройки ----------
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
 load_dotenv()
 
+# ---------- Конфиги ----------
 CLIENT_TOKEN = os.getenv("CLIENT_BOT_TOKEN")
 EXECUTOR_TOKEN = os.getenv("EXECUTOR_BOT_TOKEN")
 DATABASE_URL = os.getenv("DATABASE_URL")
@@ -37,7 +38,7 @@ def init_db():
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
-            # Таблица пользователей (добавлены поля для рейтинга)
+            # Таблица users (добавлены все поля для рейтинга)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS users (
                     telegram_id BIGINT PRIMARY KEY,
@@ -51,7 +52,14 @@ def init_db():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-            # Таблица заказов (добавлен critical)
+            # Добавляем колонки, если их нет (для старых БД)
+            for col in ['completed_orders', 'cancelled_orders', 'expired_orders']:
+                try:
+                    c.execute(f'ALTER TABLE users ADD COLUMN {col} INTEGER DEFAULT 0')
+                except:
+                    pass
+            
+            # Таблица заказов (с поддержкой critical)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS orders (
                     id SERIAL PRIMARY KEY,
@@ -61,9 +69,9 @@ def init_db():
                     description TEXT,
                     files TEXT,
                     price INTEGER NOT NULL,
-                    urgency TEXT CHECK(urgency IN ('low','medium','high','critical')) DEFAULT 'medium',
+                    urgency TEXT DEFAULT 'medium',
                     hours_to_live INTEGER NOT NULL,
-                    status TEXT CHECK(status IN ('open','in_progress','completed','closed','expired','cancelled')) DEFAULT 'open',
+                    status TEXT DEFAULT 'open',
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                     expires_at TIMESTAMP WITH TIME ZONE,
                     taken_at TIMESTAMP WITH TIME ZONE,
@@ -77,7 +85,14 @@ def init_db():
                     FOREIGN KEY (executor_id) REFERENCES users(telegram_id)
                 )
             ''')
-            # Таблица оценок (для рейтинга)
+            # Обновляем CHECK constraint для urgency (добавляем critical)
+            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_urgency_check')
+            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_urgency_check CHECK (urgency IN (\'low\', \'medium\', \'high\', \'critical\'))')
+            # Добавляем статусы, если их нет
+            c.execute('ALTER TABLE orders DROP CONSTRAINT IF EXISTS orders_status_check')
+            c.execute('ALTER TABLE orders ADD CONSTRAINT orders_status_check CHECK (status IN (\'open\', \'in_progress\', \'completed\', \'closed\', \'expired\', \'cancelled\'))')
+            
+            # Таблица reviews (для оценок)
             c.execute('''
                 CREATE TABLE IF NOT EXISTS reviews (
                     id SERIAL PRIMARY KEY,
@@ -88,11 +103,13 @@ def init_db():
                     created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
+            # Индексы
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_status ON orders(status)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_expires ON orders(expires_at)')
             c.execute('CREATE INDEX IF NOT EXISTS idx_orders_urgency ON orders(urgency)')
+            conn.commit()
     conn.close()
-    logger.info("Database initialized (critical + reviews)")
+    logger.info("Database initialized (critical + reviews + rating)")
 
 init_db()
 
@@ -138,15 +155,18 @@ def update_user_stats(telegram_id, field, delta=1):
     conn.close()
 
 # ---------- Уведомления ----------
-def send_notification(telegram_id, bot_type, text):
+def send_notification(telegram_id, bot_type, text, reply_markup=None):
     token = CLIENT_TOKEN if bot_type == 'client' else EXECUTOR_TOKEN
     if not token:
         logger.info(f"Уведомление для {telegram_id}: {text}")
         return
     try:
+        payload = {"chat_id": telegram_id, "text": text}
+        if reply_markup:
+            payload["reply_markup"] = reply_markup.to_json()
         requests.post(
             f"https://api.telegram.org/bot{token}/sendMessage",
-            json={"chat_id": telegram_id, "text": text},
+            json=payload,
             timeout=5
         )
     except Exception as e:
@@ -165,7 +185,6 @@ def expire_orders():
             expired = c.fetchall()
             for order in expired:
                 c.execute("UPDATE orders SET status='expired' WHERE id = %s", (order["id"],))
-                # Обновляем статистику заказчика
                 update_user_stats(order["customer_id"], "expired_orders")
                 send_notification(order["customer_id"], "client", f"⏰ Заказ №{order['id']} снят")
     conn.close()
@@ -293,19 +312,16 @@ def rate_executor_logic(order_id, customer_id, score):
     conn = get_db_connection()
     with conn:
         with conn.cursor() as c:
-            # Проверяем, что заказ существует и принадлежит заказчику
             c.execute("SELECT executor_id FROM orders WHERE id = %s AND customer_id = %s", (order_id, customer_id))
             order = c.fetchone()
             if not order:
                 conn.close()
                 return {"success": False, "error": "Заказ не найден"}
             executor_id = order["executor_id"]
-            # Сохраняем оценку
             c.execute(
                 "INSERT INTO reviews (order_id, executor_id, customer_id, score) VALUES (%s, %s, %s, %s)",
                 (order_id, executor_id, customer_id, score)
             )
-            # Пересчитываем средний рейтинг исполнителя
             c.execute(
                 "SELECT AVG(score) as avg_rating FROM reviews WHERE executor_id = %s",
                 (executor_id,)
@@ -420,11 +436,11 @@ async def cmd_profile(message: Message):
     user = get_user(message.from_user.id)
     await message.answer(
         f"👤 Ваш профиль:\n"
-        f"⭐ Рейтинг: {user['rating']}\n"
-        f"✅ Завершено: {user['completed_orders']}\n"
-        f"❌ Отменено: {user['cancelled_orders']}\n"
-        f"⏰ Просрочено: {user['expired_orders']}\n"
-        f"💰 Баланс: {user['balance']} баллов"
+        f"⭐ Рейтинг: {user.get('rating', 0)}\n"
+        f"✅ Завершено: {user.get('completed_orders', 0)}\n"
+        f"❌ Отменено: {user.get('cancelled_orders', 0)}\n"
+        f"⏰ Просрочено: {user.get('expired_orders', 0)}\n"
+        f"💰 Баланс: {user.get('balance', 0)} баллов"
     )
 
 @dp_client.message_handler(Command("new"))
@@ -480,7 +496,6 @@ async def process_urgency(callback: CallbackQuery, state: FSMContext):
     await callback.message.answer(messages[urgency])
     await CreateOrder.next()
     if urgency == "critical":
-        # Для critical пропускаем ввод часов
         async with state.proxy() as data:
             data['hours'] = 0.5
         await CreateOrder.next()
@@ -556,7 +571,6 @@ def get_filter_keyboard(current_filters=None):
     price = current_filters.get("price", "all")
     
     kb = InlineKeyboardMarkup(row_width=3)
-    # Срочность
     kb.add(
         InlineKeyboardButton("🔴 Critical" + (" ✅" if urgency == "critical" else ""), callback_data="filter_urgency_critical"),
         InlineKeyboardButton("🟥 High" + (" ✅" if urgency == "high" else ""), callback_data="filter_urgency_high"),
@@ -564,7 +578,6 @@ def get_filter_keyboard(current_filters=None):
         InlineKeyboardButton("🟩 Low" + (" ✅" if urgency == "low" else ""), callback_data="filter_urgency_low"),
         InlineKeyboardButton("📋 Все" + (" ✅" if urgency == "all" else ""), callback_data="filter_urgency_all")
     )
-    # Цена
     kb.add(
         InlineKeyboardButton("💰 До 10" + (" ✅" if price == "0-10" else ""), callback_data="filter_price_0-10"),
         InlineKeyboardButton("💰 10-50" + (" ✅" if price == "10-50" else ""), callback_data="filter_price_10-50"),
@@ -572,7 +585,6 @@ def get_filter_keyboard(current_filters=None):
         InlineKeyboardButton("💰 100+" + (" ✅" if price == "100+" else ""), callback_data="filter_price_100+"),
         InlineKeyboardButton("💰 Любая" + (" ✅" if price == "all" else ""), callback_data="filter_price_all")
     )
-    # Действия
     kb.add(
         InlineKeyboardButton("🔄 Сбросить фильтры", callback_data="filter_reset"),
         InlineKeyboardButton("📋 Обновить ленту", callback_data="filter_refresh")
@@ -597,18 +609,18 @@ async def cmd_start_executor(message: Message):
 @dp_executor.message_handler(Command("balance"))
 async def cmd_balance_executor(message: Message):
     user = get_user(message.from_user.id)
-    await message.answer(f"💰 Баланс: {user['balance']} баллов\n⭐ Рейтинг: {user['rating']}")
+    await message.answer(f"💰 Баланс: {user.get('balance', 0)} баллов\n⭐ Рейтинг: {user.get('rating', 0)}")
 
 @dp_executor.message_handler(Command("profile"))
 async def cmd_profile_executor(message: Message):
     user = get_user(message.from_user.id)
     await message.answer(
         f"👤 Ваш профиль исполнителя:\n"
-        f"⭐ Рейтинг: {user['rating']}\n"
-        f"✅ Завершено: {user['completed_orders']}\n"
-        f"❌ Отменено: {user['cancelled_orders']}\n"
-        f"⏰ Просрочено: {user['expired_orders']}\n"
-        f"💰 Баланс: {user['balance']} баллов"
+        f"⭐ Рейтинг: {user.get('rating', 0)}\n"
+        f"✅ Завершено: {user.get('completed_orders', 0)}\n"
+        f"❌ Отменено: {user.get('cancelled_orders', 0)}\n"
+        f"⏰ Просрочено: {user.get('expired_orders', 0)}\n"
+        f"💰 Баланс: {user.get('balance', 0)} баллов"
     )
 
 @dp_executor.message_handler(Command("filters"))
@@ -632,11 +644,9 @@ async def filter_callback(callback: CallbackQuery):
     if action == "refresh":
         await callback.message.answer("🔄 Лента обновлена.")
         await callback.answer()
-        # Показываем ленту с текущими фильтрами
         await show_feed(callback.message, tg_id)
         return
     
-    # Парсим фильтры
     parts = action.split("_")
     if len(parts) != 2:
         await callback.answer()
@@ -651,7 +661,6 @@ async def filter_callback(callback: CallbackQuery):
     elif filter_type == "price":
         user_filters[tg_id]["price"] = value if value != "all" else None
     
-    # Обновляем клавиатуру
     current = user_filters[tg_id]
     kb = get_filter_keyboard(current)
     await callback.message.edit_text("🔍 Выберите фильтры:", reply_markup=kb)
@@ -661,14 +670,11 @@ async def show_feed(message, tg_id, offset=0):
     """Показывает ленту с учётом фильтров и пагинации"""
     filters = user_filters.get(tg_id, {})
     
-    # Преобразуем фильтры в параметры для БД
     db_filters = {"status": "open", "limit": 5, "offset": offset}
     
-    # Срочность
     if filters.get("urgency"):
         db_filters["urgency"] = filters["urgency"]
     
-    # Цена
     price_filter = filters.get("price")
     if price_filter:
         if price_filter == "0-10":
@@ -694,17 +700,23 @@ async def show_feed(message, tg_id, offset=0):
         return
     
     for o in orders:
-        expires_dt = datetime.fromisoformat(o['expires_at'])
-        expires_str = expires_dt.strftime("%d.%m.%Y %H:%M")
+        # Защита от None в expires_at
+        if o.get('expires_at'):
+            try:
+                expires_dt = datetime.fromisoformat(o['expires_at'])
+                expires_str = expires_dt.strftime("%d.%m.%Y %H:%M")
+            except:
+                expires_str = "неизвестно"
+        else:
+            expires_str = "неизвестно"
         
-        # Иконки срочности
         urgency_icons = {
             "critical": "🔴",
             "high": "🟥",
             "medium": "🟨",
             "low": "🟩"
         }
-        icon = urgency_icons.get(o['urgency'], "🟩")
+        icon = urgency_icons.get(o.get('urgency'), "🟩")
         
         has_files = o.get('files') and o['files'] != '[]'
         text = (
@@ -724,7 +736,6 @@ async def show_feed(message, tg_id, offset=0):
             except:
                 pass
     
-    # Пагинация
     nav_kb = InlineKeyboardMarkup(inline_keyboard=[
         [
             InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{offset-5}"),
@@ -735,7 +746,7 @@ async def show_feed(message, tg_id, offset=0):
     ])
     await message.answer("📋 Навигация:", reply_markup=nav_kb)
 
-@dp_executor.callback_query_handler(lambda c: c.data.startswith("page_"))
+@dp_executor.callback_query_handler(lambda c: c.data.startswith("page_") and c.data != "page_info")
 async def page_callback(callback: CallbackQuery):
     offset = int(callback.data.split("_")[1])
     if offset < 0:
