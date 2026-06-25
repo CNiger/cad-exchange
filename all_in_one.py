@@ -419,7 +419,8 @@ class CreateOrder(StatesGroup):
     files = State()
 
 @dp_client.message_handler(Command("start"))
-async def cmd_start(message: Message):
+async def cmd_start(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
     user = get_user(message.from_user.id, message.from_user.username)
     await message.answer(
         f"🏗️ Добро пожаловать!\nВаш баланс: {user['balance']} баллов\n\n"
@@ -427,12 +428,14 @@ async def cmd_start(message: Message):
     )
 
 @dp_client.message_handler(Command("balance"))
-async def cmd_balance(message: Message):
+async def cmd_balance(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
     user = get_user(message.from_user.id)
     await message.answer(f"💰 Баланс: {user['balance']} баллов\n⭐ Рейтинг: {user['rating']}")
 
 @dp_client.message_handler(Command("profile"))
-async def cmd_profile(message: Message):
+async def cmd_profile(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
     user = get_user(message.from_user.id)
     await message.answer(
         f"👤 Ваш профиль:\n"
@@ -443,8 +446,83 @@ async def cmd_profile(message: Message):
         f"💰 Баланс: {user.get('balance', 0)} баллов"
     )
 
+@dp_client.message_handler(Command("my_orders"))
+async def cmd_my_orders(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
+    result = get_orders_logic({"customer_id": message.from_user.id})
+    if not result.get("success"):
+        await message.answer("❌ Ошибка")
+        return
+    orders = result.get("data", [])
+    if not orders:
+        await message.answer("У вас нет заказов.")
+        return
+    text = "📋 Ваши заказы:\n"
+    for o in orders:
+        text += f"#{o['id']} | {o['title']} | {o['status']} | {o['price']} баллов\n"
+    await message.answer(text)
+
+@dp_client.message_handler(Command("accept"))
+async def cmd_accept(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Использование: /accept <ID>")
+        return
+    try:
+        order_id = int(args[1])
+    except:
+        await message.answer("ID должно быть числом")
+        return
+    result = accept_order_logic(order_id, message.from_user.id)
+    if result.get("success"):
+        await message.answer(f"✅ Заказ #{order_id} принят")
+    else:
+        await message.answer(f"❌ {result.get('error')}")
+
+@dp_client.message_handler(Command("cancel_order"))
+async def cmd_cancel_order(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Использование: /cancel_order <ID>")
+        return
+    try:
+        order_id = int(args[1])
+    except:
+        await message.answer("ID должно быть числом")
+        return
+    result = cancel_order_logic(order_id, message.from_user.id)
+    if result.get("success"):
+        await message.answer(f"❌ Заказ #{order_id} отменён")
+    else:
+        await message.answer(f"❌ {result.get('error')}")
+
+@dp_client.message_handler(Command("help"))
+async def cmd_help(message: Message, state: FSMContext):
+    await state.finish()  # Сброс состояния
+    await message.answer(
+        "Команды заказчика:\n"
+        "/new - создать заказ\n"
+        "/my_orders - мои заказы\n"
+        "/accept <id> - принять работу\n"
+        "/cancel_order <id> - отменить заказ\n"
+        "/balance - баланс\n"
+        "/profile - мой профиль\n"
+        "/cancel - отменить создание заказа"
+    )
+
+# Команда /cancel принудительно сбрасывает состояние
+@dp_client.message_handler(Command("cancel"), state='*')
+async def cancel_cmd(message: Message, state: FSMContext):
+    await state.finish()
+    await message.answer("✅ Создание заказа отменено.")
+
+# --- Обработчики создания заказа (без изменений) ---
 @dp_client.message_handler(Command("new"))
-async def cmd_new(message: Message):
+async def cmd_new(message: Message, state: FSMContext):
+    # Не сбрасываем, а перезапускаем создание
+    await state.finish()  # Сначала сбрасываем старое состояние
     await CreateOrder.title.set()
     await message.answer("Введите заголовок задачи:")
 
@@ -541,8 +619,10 @@ async def finish_files(message: Message, state: FSMContext):
         await message.answer(f"❌ Ошибка: {result.get('error')}")
     await state.finish()
 
+# Обработчик оценки
 @dp_client.callback_query_handler(lambda c: c.data.startswith("rate_"))
-async def rate_callback(callback: CallbackQuery):
+async def rate_callback(callback: CallbackQuery, state: FSMContext):
+    await state.finish()  # Сброс состояния
     parts = callback.data.split("_")
     order_id = int(parts[1])
     score = int(parts[2])
@@ -552,6 +632,8 @@ async def rate_callback(callback: CallbackQuery):
     else:
         await callback.message.answer(f"❌ Ошибка: {result.get('error')}")
     await callback.answer()
+
+
 
 # ---------- Executor Bot ----------
 executor_bot = Bot(token=EXECUTOR_TOKEN)
